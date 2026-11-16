@@ -234,4 +234,11 @@ KERNELS = [
     Kernel('attention_512', 'ops/attention.slang', [  # VAE mid-block attention
         Entry('attention_main', [F32, F16, BF16], constants=(512, 8, 8)),
     ]),
+    # fused attention on cooperative matrices, per head size
+    Kernel('attention_coop_64', 'ops/attention_coop.slang', [
+        Entry('attention_coop_main', [F16, BF16], constants=(64,)),
+    ]),
+    Kernel('attention_coop_128', 'ops/attention_coop.slang', [
+        Entry('attention_coop_main', [F16, BF16], constants=(128,)),
+    ]),
 ]

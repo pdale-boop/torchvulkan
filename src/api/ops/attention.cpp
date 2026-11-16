@@ -1,9 +1,11 @@
 #include <torch/extension.h>
 #include <ATen/ops/scaled_dot_product_attention_native.h>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
+#include "vulkan/autotuner.h"
 #include "api/ops/helpers.h"
 #include "api/fallback.h"
 
@@ -66,6 +68,123 @@ uint32_t attention_row_lanes(int64_t head_dim)
     return head_dim > 256 ? 8 : 4;
 }
 
+constexpr int64_t ATTENTION_COOP_SUBGROUPS = 4;  // SUBGROUPS in attention_coop.slang
+constexpr int64_t ATTENTION_COOP_ROWS = ATTENTION_COOP_SUBGROUPS * 16;  // query rows per workgroup
+constexpr int64_t ATTENTION_COOP_KEYS = 32;  // BC in attention_coop.slang
+
+bool env_flag(const char* name)
+{
+    const char* v = std::getenv(name);
+    return v && v[0] != '\0' && v[0] != '0';
+}
+
+// One way to run the fused attention: its dispatch, and its output [batch * heads, rows, head_dim],
+// whose first lq rows are the result.
+struct AttentionPlan
+{
+    TuneDispatch dispatch;
+    at::Tensor out;
+    int64_t lq = 0;
+
+    at::Tensor result() const { return out.size(1) == lq ? out : out.narrow(1, 0, lq).contiguous(); }
+};
+
+// The cooperative-matrix kernel: float16 or bfloat16, head sizes 64 and 128, on devices with 16x16x16
+// T x T -> float32 cooperative matrices and subgroup shuffles (the softmax combines lanes with them).
+bool coop_applies(DeviceContext* device, at::ScalarType dtype, int64_t head_dim)
+{
+    if (!device->support_coopmat || !device->support_subgroup_shuffle) return false;
+    if ((dtype != at::kHalf && dtype != at::kBFloat16) || (head_dim != 64 && head_dim != 128)) return false;
+
+    bool has_fragment = false;
+    for (const CoopMatConfig& c : device->cache.getCoopMatConfig(dtype, dtype, at::kFloat, at::kFloat)) {
+        if (c.m == 16 && c.n == 16 && c.k == 16) has_fragment = true;
+    }
+    const uint32_t subgroup = device->default_subgroup_size;
+    const uint64_t element = c10::elementSize(dtype);
+    const uint64_t shared = 2 * ATTENTION_COOP_KEYS * head_dim * element            // K and V tiles
+                          + ATTENTION_COOP_ROWS * ATTENTION_COOP_KEYS * (element + 4) // P and S
+                          + ATTENTION_COOP_ROWS * 16 * 4;                             // row factors
+    return has_fragment && subgroup > 0 &&
+           ATTENTION_COOP_SUBGROUPS * subgroup <= device->properties.limits.maxComputeWorkGroupInvocations &&
+           shared <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
+// q, k and v are contiguous [batch * heads, length, head_dim]
+AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, float softmax_scale)
+{
+    const int64_t batch_heads = q.size(0);
+    const int64_t lq = q.size(1);
+    const int64_t head_dim = q.size(2);
+    const int64_t lq_padded = (lq + ATTENTION_COOP_ROWS - 1) / ATTENTION_COOP_ROWS * ATTENTION_COOP_ROWS;
+    const uint32_t subgroup = device->default_subgroup_size;
+
+    // whole 16-row fragments are loaded and stored, so q and the output are padded to whole
+    // workgroups. Query rows are independent and the padded rows' output is discarded, so the
+    // padding needs no particular contents.
+    at::Tensor q_padded = q;
+    if (lq_padded != lq) {
+        q_padded = at::empty({batch_heads, lq_padded, head_dim}, q.options());
+        q_padded.narrow(1, 0, lq).copy_(q);
+    }
+
+    AttentionPlan plan;
+    plan.lq = lq;
+    plan.out = at::empty({batch_heads, lq_padded, head_dim}, q.options());
+    TuneDispatch& d = plan.dispatch;
+    d.key = ShaderKey{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, q.scalar_type()};
+    d.subgroupSize = subgroup;
+    d.spec.push(static_cast<uint32_t>(ATTENTION_COOP_SUBGROUPS * subgroup)).push(subgroup);
+    d.push.push(get_tensor_address(q_padded))
+          .push(get_tensor_address(k))
+          .push(get_tensor_address(v))
+          .push(get_output_address(plan.out))
+          .push(static_cast<uint32_t>(lq_padded))
+          .push(static_cast<uint32_t>(k.size(1)))
+          .push(softmax_scale)
+          .push(static_cast<uint32_t>(0));
+    d.read = {q_padded, k, v};
+    d.write = {plan.out};
+    d.groupX = static_cast<uint32_t>(lq_padded / ATTENTION_COOP_ROWS);
+    d.groupY = static_cast<uint32_t>(batch_heads);
+    return plan;
+}
+
+// The scalar kernel needs quad operations (or shuffles, for 8 lanes per row).
+bool scalar_applies(DeviceContext* device, int64_t head_dim)
+{
+    return attention_row_lanes(head_dim) == 4 ? device->support_subgroup_quad : device->support_subgroup_shuffle;
+}
+
+AttentionPlan scalar_plan(DeviceContext* device, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, float softmax_scale)
+{
+    const int64_t batch_heads = q.size(0);
+    const int64_t lq = q.size(1);
+    const int64_t head_dim = q.size(2);
+    const int64_t rows_per_group = ATTENTION_WG_SIZE / attention_row_lanes(head_dim);
+
+    AttentionPlan plan;
+    plan.lq = lq;
+    plan.out = at::empty({batch_heads, lq, head_dim}, q.options());
+    TuneDispatch& d = plan.dispatch;
+    d.key = ShaderKey{attention_kernel_for(head_dim), q.scalar_type()};
+    d.subgroupSize = device->default_subgroup_size;
+    d.spec.push(ATTENTION_WG_SIZE);
+    d.push.push(get_tensor_address(q))
+          .push(get_tensor_address(k))
+          .push(get_tensor_address(v))
+          .push(get_output_address(plan.out))
+          .push(static_cast<uint32_t>(lq))
+          .push(static_cast<uint32_t>(k.size(1)))
+          .push(static_cast<uint32_t>(head_dim))
+          .push(softmax_scale);
+    d.read = {q, k, v};
+    d.write = {plan.out};
+    d.groupX = static_cast<uint32_t>((lq + rows_per_group - 1) / rows_per_group);
+    d.groupY = static_cast<uint32_t>(batch_heads);
+    return plan;
+}
+
 at::Tensor scaled_dot_product_attention_vulkan(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -80,11 +199,8 @@ at::Tensor scaled_dot_product_attention_vulkan(
         return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
 
     DeviceContext* device = get_device_context(query);
-    // like every other op, the dtype must be supported on the device (bf16 isn't on Turing or llvmpipe),
-    // and the shader needs quad operations (or shuffles, for 8 lanes per row)
-    uint32_t row_lanes = attention_row_lanes(query.size(-1));
-    bool lanes_ok = row_lanes == 4 ? device->support_subgroup_quad : device->support_subgroup_shuffle;
-    if (!is_dtype_supported(device, query.scalar_type()) || !lanes_ok)
+    // like every other op, the dtype must be supported on the device (bf16 isn't on Turing or llvmpipe)
+    if (!is_dtype_supported(device, query.scalar_type()))
         return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
     int64_t lq = query.size(-2);
     int64_t lk = key.size(-2);
@@ -97,37 +213,34 @@ at::Tensor scaled_dot_product_attention_vulkan(
     at::Tensor q = query.reshape({batch_heads, lq, head_dim}).contiguous();
     at::Tensor k = key.reshape({batch_heads, lk, head_dim}).contiguous();
     at::Tensor v = value.reshape({batch_heads, lk, head_dim}).contiguous();
-    at::Tensor out = at::empty({batch_heads, lq, head_dim}, q.options());
+    float softmax_scale = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
-    int64_t rows_per_group = ATTENTION_WG_SIZE / row_lanes;
-    float softmax_scale =scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
+    // TORCHVULKAN_ATTENTION_SCALAR=1 or _COOP=1 forces one kernel (for comparisons)
+    bool coop = coop_applies(device, query.scalar_type(), head_dim) && !env_flag("TORCHVULKAN_ATTENTION_SCALAR");
+    bool scalar = scalar_applies(device, head_dim) && !(coop && env_flag("TORCHVULKAN_ATTENTION_COOP"));
+    if (!coop && !scalar)
+        return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
 
-    SpecializationBuilder spd{};
-    spd.push(ATTENTION_WG_SIZE);
+    // Cooperative matrices win where the GPU has matrix units, but some drivers emulate them (an
+    // RDNA2 GPU under Windows, where the coop kernel was slower), so when both kernels apply the
+    // autotuner times them once per device and problem class.
+    bool use_coop = coop;
+    if (coop && scalar && device->tuner) {
+        TuneSpace space;
+        space.params = {{"coop", {0, 1}}};
+        auto bucket = [](int64_t x) -> uint64_t { uint64_t b = 1; while (b < static_cast<uint64_t>(x) && b < 65536) b <<= 1; return b; };
+        const uint64_t tuned_id = bucket(lq) | (bucket(lk) << 17) | (static_cast<uint64_t>(head_dim) << 34);
+        const ShaderKey key{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, query.scalar_type()};
+        const TuneConfig& chosen = device->tuner->select(key, tuned_id, space, [&](const TuneConfig& cfg) {
+            return (cfg[0] == 1 ? coop_plan(device, q, k, v, softmax_scale) : scalar_plan(device, q, k, v, softmax_scale)).dispatch;
+        });
+        if (!chosen.empty()) use_coop = chosen[0] == 1;
+    }
 
-    PushConstantBuilder pcs{};
-    pcs.push(get_tensor_address(q))
-       .push(get_tensor_address(k))
-       .push(get_tensor_address(v))
-       .push(get_output_address(out))
-       .push(static_cast<uint32_t>(lq))
-       .push(static_cast<uint32_t>(lk))
-       .push(static_cast<uint32_t>(head_dim))
-       .push(softmax_scale);
-
-    device->shader_manager->dispatchShader(
-        ShaderKey{attention_kernel_for(head_dim), query.scalar_type()},
-        device->default_subgroup_size,
-        spd.build(),
-        pcs.build(),
-        /* read = */ {q, k, v},
-        /* write = */ {out},
-        static_cast<uint32_t>((lq + rows_per_group - 1) / rows_per_group),
-        static_cast<uint32_t>(batch_heads),
-        1
-    );
-
-    return out.view(query.sizes());
+    AttentionPlan plan = use_coop ? coop_plan(device, q, k, v, softmax_scale) : scalar_plan(device, q, k, v, softmax_scale);
+    const TuneDispatch& d = plan.dispatch;
+    device->shader_manager->dispatchShader(d.key, d.subgroupSize, d.spec.build(), d.push.build(), d.read, d.write, d.groupX, d.groupY, d.groupZ);
+    return plan.result().view(query.sizes());
 }
 
 } // namespace
