@@ -192,6 +192,7 @@ TORCHVULKAN_STRICT=1 python your_script.py
 - `float64` runs on the GPU only on devices with `shaderFloat64`; elsewhere it falls back to the CPU. Transcendental functions such as `exp`, `sin` and `tanh` are computed in `float32` precision for `float64` tensors.
 - `bfloat16` runs on the GPU only on devices with `VK_KHR_shader_bfloat16`; elsewhere it falls back to the CPU.
 - Complex tensors can live on the device and FFTs run on the GPU, but most complex arithmetic falls back to the CPU.
+- `scaled_dot_product_attention` runs as a fused kernel, which never stores the full attention matrix, for inference without a mask, dropout or `is_causal`, with head sizes up to 512. Other calls use PyTorch's reference implementation, which stores the full `L × S` matrix and needs far more memory for long sequences.
 - APIs and coverage may change before `1.0.0`.
 
 ## How it works
