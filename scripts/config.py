@@ -82,7 +82,11 @@ class Entry:
 class Kernel:
     name: str
     module: str # path relative to src/shaders
-    entries: list 
+    entries: list
+    # slangc -fp-mode. By default slangc may turn x / constant into a multiply by the reciprocal and
+    # lets the driver fuse a multiply and an add; 'precise' keeps every operation's own rounding, for
+    # kernels that must match the CPU bit for bit.
+    fp_mode: str = None
 
 
 KERNELS = [
@@ -158,16 +162,17 @@ KERNELS = [
     Kernel('int_mm_coop_16x32', 'ops/matmul_coop.slang', [  # NVIDIA's int8 fragments are 16 x 16 x 32
         Entry('int_mm_coop_main', [I8], ('vec',), constants=(16, 32)),
     ]),
-    # int8 linear: _int_mm with the scaled output written in the output dtype (int8 VEC 4)
+    # int8 linear: _int_mm with the scaled output written in the output dtype (int8 VEC 4), and the
+    # row-wise quantization; both match the CPU bit for bit, hence fp_mode='precise'
     Kernel('int8_mm_scaled_coop_16', 'ops/matmul_coop.slang', [
         Entry('int8_mm_scaled_coop_main', [F32, F16, BF16], constants=(4, 16, 16)),
-    ]),
+    ], fp_mode='precise'),
     Kernel('int8_mm_scaled_coop_16x32', 'ops/matmul_coop.slang', [
         Entry('int8_mm_scaled_coop_main', [F32, F16, BF16], constants=(4, 16, 32)),
-    ]),
+    ], fp_mode='precise'),
     Kernel('quantize_int8_rows', 'ops/quantize_int8.slang', [
         Entry('quantize_int8_rows_main', [F32, F16, BF16]),
-    ]),
+    ], fp_mode='precise'),
     Kernel('resample_u8', 'ops/resample_u8.slang', [
         Entry('resample_u8_main', [U8]),
     ]),

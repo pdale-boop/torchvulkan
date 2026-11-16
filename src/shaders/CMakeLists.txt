@@ -28,10 +28,15 @@ file(GLOB_RECURSE SHADER_MODULES CONFIGURE_DEPENDS
 set(SPV_FILES "")
 
 function(torchvulkan_add_shader NAME SOURCE ENTRY)
+    # optional FP_MODE <mode>: slangc's floating-point mode for this shader (see scripts/config.py)
+    cmake_parse_arguments(SHADER "" "FP_MODE" "" ${ARGN})
     set(SPECIALIZE_ARGS "")
-    foreach(ARG ${ARGN})
+    foreach(ARG ${SHADER_UNPARSED_ARGUMENTS})
         list(APPEND SPECIALIZE_ARGS -specialize ${ARG})
     endforeach()
+    if (SHADER_FP_MODE)
+        list(APPEND SPECIALIZE_ARGS -fp-mode ${SHADER_FP_MODE})
+    endif()
 
     set(SPV_OUT "${SHADER_OUT_DIR}/${NAME}.spv")
 

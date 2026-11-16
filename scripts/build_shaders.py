@@ -70,7 +70,8 @@ def main(args):
         kernel_names.append(kernel.name)
 
         for name, source, function, spec_args, aten in kernel_variants(kernel, args.src):
-            cmake.append('torchvulkan_add_shader(' + ' '.join([name, cmake_quote(source), function] + spec_args) + ')')
+            fp_mode = ['FP_MODE', kernel.fp_mode] if kernel.fp_mode else []
+            cmake.append('torchvulkan_add_shader(' + ' '.join([name, cmake_quote(source), function] + fp_mode + spec_args) + ')')
             variants.append({'name': name, 'kernel': kernel.name, 'aten': aten})
 
     write_if_changed(args.out / 'variants.cmake', '\n'.join(cmake) + '\n')

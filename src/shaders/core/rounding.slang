@@ -7,6 +7,10 @@ float16 conversion to the driver (AMD's is not round-to-nearest-even). Kernels t
 CPU bit for bit use these instead.
 
 A 16-bit float kind is 1 for float16 and 2 for bfloat16 (0 means float32).
+
+Kernels using divRounded must be compiled with fp_mode='precise' (scripts/config.py): otherwise slangc
+ignores `precise`, so the driver may fuse Dekker's steps, and turns a division by a constant into a
+multiplication by its reciprocal.
 */
 
 // splits x into a high part with 12 significant bits and the exact remainder (Veltkamp)
