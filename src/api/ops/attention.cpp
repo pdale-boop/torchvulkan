@@ -73,6 +73,10 @@ at::Tensor scaled_dot_product_attention_vulkan(
         return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
 
     DeviceContext* device = get_device_context(query);
+    // like every other op, the dtype must be supported on the device (bf16 isn't on Turing or llvmpipe),
+    // and the shader needs quad operations
+    if (!is_dtype_supported(device, query.scalar_type()) || !device->support_subgroup_quad)
+        return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
     int64_t lq = query.size(-2);
     int64_t lk = key.size(-2);
     int64_t head_dim = query.size(-1);

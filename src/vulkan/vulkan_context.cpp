@@ -319,6 +319,12 @@ void VulkanContext::createDeviceContexts()
             subgroupProps.subgroupSize > 0 &&
             context->support_subgroup_control;
 
+        // fused attention sums each row's dot products across a quad
+        context->support_subgroup_quad =
+            (subgroupProps.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
+            (subgroupProps.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) &&
+            subgroupProps.subgroupSize >= 4;
+
         VkPhysicalDeviceMemoryProperties memProperties;
         vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
 
