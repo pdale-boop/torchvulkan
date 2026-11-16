@@ -9,7 +9,9 @@
 
 namespace {
 
-constexpr uint32_t ATTENTION_WG_SIZE = 64;
+// threads per workgroup; the shader gives each query row 4 lanes, so 32 rows per workgroup
+constexpr uint32_t ATTENTION_WG_SIZE = 128;
+constexpr uint32_t ATTENTION_ROWS = ATTENTION_WG_SIZE / 4;
 
 // PyTorch's own composite implementation, which is what runs without this kernel.
 // It converts boolean masks before reaching the math path, so call it rather than
@@ -106,7 +108,7 @@ at::Tensor scaled_dot_product_attention_vulkan(
         pcs.build(),
         /* read = */ {q, k, v},
         /* write = */ {out},
-        static_cast<uint32_t>((lq + ATTENTION_WG_SIZE - 1) / ATTENTION_WG_SIZE),
+        static_cast<uint32_t>((lq + ATTENTION_ROWS - 1) / ATTENTION_ROWS),
         static_cast<uint32_t>(batch_heads),
         1
     );
