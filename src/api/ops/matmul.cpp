@@ -3,6 +3,9 @@
 #include <ATen/native/Resize.h>
 #include <cstdlib>
 #include <functional>
+#include <limits>
+#include <optional>
+#include <tuple>
 #include <cstdio>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
@@ -570,7 +573,17 @@ uint64_t int_mm_shared_bytes(const CoopMatParams& params, uint32_t block, uint32
     return 2 * (rows_a * (bk + pad) + std::max<uint64_t>(bk * (cols_b + pad), cols_b * (bk + pad)));
 }
 
-bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out)
+// The scaled output of an int8 linear (torchvulkan::int8_scaled_mm), applied by int_mm_coop as each
+// block of int32 results leaves the cooperative matrices: out = (acc * (x_scale[row] * w_scale[col]))
+// in out's dtype, plus bias. x_scale is float [M], w_scale float [1] or [N], bias out's dtype [N].
+struct Int8ScaledOutput
+{
+    at::Tensor x_scale;
+    at::Tensor w_scale;
+    std::optional<at::Tensor> bias;
+};
+
+bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out, const Int8ScaledOutput* scaled = nullptr)
 {
     DeviceContext* device = get_device_context(self);
     if (!device->support_coopmat) return false;
@@ -584,7 +597,13 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
         if (c.m == block && c.n == block && (c.k == 16 || c.k == 32) && (kb == 0 || c.k < kb)) kb = c.k;
     }
     if (kb == 0) return false;
-    const torchvulkan::Kernel coop_kernel = kb == 16 ? torchvulkan::Kernel::INT_MM_COOP_16 : torchvulkan::Kernel::INT_MM_COOP_16X32;
+    torchvulkan::Kernel coop_kernel = kb == 16 ? torchvulkan::Kernel::INT_MM_COOP_16 : torchvulkan::Kernel::INT_MM_COOP_16X32;
+    // the scaled kernels are compiled per output dtype; the plain one is keyed by int8
+    at::ScalarType key_dtype = at::kChar;
+    if (scaled) {
+        coop_kernel = kb == 16 ? torchvulkan::Kernel::INT8_MM_SCALED_COOP_16 : torchvulkan::Kernel::INT8_MM_SCALED_COOP_16X32;
+        key_dtype = out.scalar_type();
+    }
 
     const uint32_t M = static_cast<uint32_t>(self.size(0));
     const uint32_t K = static_cast<uint32_t>(self.size(1));
@@ -620,8 +639,12 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     // (a K step is a whole number of fragments)
     uint32_t default_bk = (params.use_shared_memory && b_is_transposed) ? 32 : params.bk;
     default_bk = ((std::max(default_bk, kb) + kb - 1) / kb) * kb;
+    // the scaled output stages one 16 x 16 int32 block per subgroup (epilogueStage in matmul_coop.slang)
+    const uint64_t epilogue_bytes = scaled ? (uint64_t)params.warps_m * params.warps_n * 256 * 4 : 0;
+    if (epilogue_bytes > max_smem) return false;
     auto bk_fits = [&](uint32_t bk, uint32_t pad) {
-        return bk >= kb && bk % kb == 0 && (!params.use_shared_memory || int_mm_shared_bytes(params, block, bk, pad) <= max_smem);
+        return bk >= kb && bk % kb == 0 &&
+               (!params.use_shared_memory || int_mm_shared_bytes(params, block, bk, pad) + epilogue_bytes <= max_smem);
     };
 
     auto coop_loadable = [](const at::Tensor& t) { return t.stride(-1) == 1 || t.stride(-2) == 1; };
@@ -636,7 +659,9 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
 
     // whole fragments are stored, so the result is written straight into `out` only when it has
     // no partial tiles and rows that are 16-byte aligned; otherwise into a padded scratch tensor
-    const bool direct = M_padded == M && N_padded == N && out.stride(1) == 1 && out.stride(0) % 4 == 0 && out.stride(0) >= (int64_t)N &&
+    // (the scaled output is written element by element with bounds checks, so always directly)
+    const bool direct = scaled ? true :
+                        M_padded == M && N_padded == N && out.stride(1) == 1 && out.stride(0) % 4 == 0 && out.stride(0) >= (int64_t)N &&
                         (get_tensor_address(out) % 16) == 0;
     at::Tensor result = direct ? out : at::empty({(int64_t)M_padded, (int64_t)N_padded}, out.options());
 
@@ -664,7 +689,7 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     auto make_dispatch = [&](uint32_t bk, uint32_t pad) {
         const uint32_t a_vec_aligned = (!a_transposed && strides_a[1] % vec == 0 && strides_a[0] % vec == 0 && bk % vec == 0) ? 1 : 0;
         TuneDispatch d;
-        d.key = ShaderKey{coop_kernel, at::kChar};
+        d.key = ShaderKey{coop_kernel, key_dtype};
         d.subgroupSize = params.subgroup_size;
         d.spec.push(params.workgroup_size)
               .push(params.subgroup_size)
@@ -688,6 +713,32 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
               .push(static_cast<uint32_t>(params.use_shared_memory))
               .push(b_transposed) // B_SMEM_COLMAJOR
               .push(pad);         // PAD
+        if (scaled) {
+            // Int8ScaledPushConstants
+            const at::Tensor& bias = scaled->bias ? *scaled->bias : at::Tensor();
+            d.push.push(get_tensor_address(a))
+                  .push(get_tensor_address(b))
+                  .push(get_tensor_address(out))
+                  .push(bias.defined() ? get_tensor_address(bias) : (uint64_t)0)
+                  .push(get_tensor_address(scaled->x_scale))
+                  .push(get_tensor_address(scaled->w_scale))
+                  .push_array(strides_a)
+                  .push_array(strides_b)
+                  .push(static_cast<uint32_t>(out.stride(0)))
+                  .push(M)
+                  .push(N)
+                  .push(K)
+                  .push(static_cast<uint32_t>(scaled->w_scale.numel() > 1))
+                  .push((uint32_t)0)
+                  .push((uint32_t)0)
+                  .push((uint32_t)0);
+            d.read = {a, b, scaled->x_scale, scaled->w_scale};
+            if (bias.defined()) d.read.push_back(bias);
+            d.write = {out};
+            d.groupX = N_padded / tile_n;
+            d.groupY = M_padded / tile_m;
+            return d;
+        }
         d.push.push(get_tensor_address(a))
               .push(get_tensor_address(b))
               .push(get_tensor_address(c))
@@ -728,7 +779,7 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
         const uint64_t tuned_id = bucket(M) | (bucket(N) << 16) | (bucket(K) << 32) |
                                   ((uint64_t)a_transposed << 48) | ((uint64_t)b_transposed << 49) |
                                   ((uint64_t)params.subgroup_size << 50);
-        const TuneConfig& chosen = device->tuner->select(ShaderKey{coop_kernel, at::kChar}, tuned_id, space,
+        const TuneConfig& chosen = device->tuner->select(ShaderKey{coop_kernel, key_dtype}, tuned_id, space,
             [&](const TuneConfig& cfg) { return make_dispatch(cfg[1], cfg[0]); });
         if (!chosen.empty()) { pad = chosen[0]; bk = chosen[1]; }
     }
@@ -801,7 +852,104 @@ at::Tensor int_mm_vulkan(const at::Tensor& self, const at::Tensor& mat2)
     return out;
 }
 
+bool is_int8_linear_float(at::ScalarType t) { return t == at::kFloat || t == at::kHalf || t == at::kBFloat16; }
+
+// torchvulkan::int8_scaled_mm: the matmul and output scaling of an int8 linear layer,
+//   out = (_int_mm(a, b) * (a_scale * b_scale)).to(out_dtype) + bias
+// with a int8 [M, K] (quantized activations), b int8 [K, N] (usually weight.t()), a_scale float
+// [M] or [M, 1] (per row of a), b_scale float [1] or [N] (per column of b) and bias [N]. The products
+// and scales are computed in float32 and rounded once to out_dtype, then the bias is added in
+// out_dtype, as comfy_kitchen's eager int8_linear does; on cooperative matrices the int32 product is
+// scaled as it leaves the matrix units instead of going through device memory.
+at::Tensor int8_scaled_mm_vulkan(const at::Tensor& a, const at::Tensor& b, const at::Tensor& a_scale, const at::Tensor& b_scale,
+                                 const std::optional<at::Tensor>& bias, std::optional<at::ScalarType> out_dtype_opt)
+{
+    TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "int8_scaled_mm: expected 2D tensors, got ", a.dim(), "D and ", b.dim(), "D");
+    TORCH_CHECK(a.scalar_type() == at::kChar && b.scalar_type() == at::kChar,
+        "int8_scaled_mm: expected int8 inputs, got ", a.scalar_type(), " and ", b.scalar_type());
+    TORCH_CHECK(a.size(1) == b.size(0), "int8_scaled_mm: a.size(1) (", a.size(1), ") must match b.size(0) (", b.size(0), ")");
+    const at::ScalarType out_dtype = out_dtype_opt.value_or(at::kBFloat16);
+    TORCH_CHECK(is_int8_linear_float(out_dtype), "int8_scaled_mm: out_dtype must be float32, float16 or bfloat16, got ", out_dtype);
+    const int64_t M = a.size(0), K = a.size(1), N = b.size(1);
+    TORCH_CHECK(M <= UINT32_MAX && N <= UINT32_MAX && K <= UINT32_MAX, "int8_scaled_mm: dimensions too large");
+
+    Int8ScaledOutput scaled;
+    scaled.x_scale = a_scale.to(a.device(), at::kFloat).reshape(-1).contiguous();
+    scaled.w_scale = b_scale.to(a.device(), at::kFloat).reshape(-1).contiguous();
+    TORCH_CHECK(scaled.x_scale.numel() == M, "int8_scaled_mm: a_scale must have one value per row of a (", M, "), got ", scaled.x_scale.numel());
+    TORCH_CHECK(scaled.w_scale.numel() == 1 || scaled.w_scale.numel() == N,
+        "int8_scaled_mm: b_scale must have 1 or ", N, " values, got ", scaled.w_scale.numel());
+    if (bias && bias->defined()) {
+        scaled.bias = bias->to(a.device(), out_dtype).reshape(-1).contiguous();
+        TORCH_CHECK(scaled.bias->numel() == N, "int8_scaled_mm: bias must have ", N, " values, got ", scaled.bias->numel());
+    }
+
+    at::Tensor out = at::empty({M, N}, a.options().dtype(out_dtype));
+    if (M == 0 || N == 0) return out;
+    if (K > 0 && int_mm_coop(a, b, out, &scaled)) return out;
+
+    // the same math in separate ops
+    at::Tensor result = (at::_int_mm(a, b).to(at::kFloat) * (scaled.x_scale.reshape({M, 1}) * scaled.w_scale.reshape({1, -1}))).to(out_dtype);
+    if (scaled.bias) result = result + scaled.bias->reshape({1, N});
+    return result;
+}
+
+// torchvulkan::quantize_int8_rowwise: x [..., K] -> (int8 [..., K], float32 scales [..., 1]), with
+//   scale = max(float(max |x|) / 127, 1e-30) per row, q = round_half_even(x / scale) clamped to int8
+// and x / scale computed in x's dtype, as in comfy_kitchen's quantize_int8_rowwise. One kernel reads
+// each row and writes both outputs.
+std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise_vulkan(const at::Tensor& x)
+{
+    TORCH_CHECK(x.dim() >= 1, "quantize_int8_rowwise: expected at least 1 dimension");
+    TORCH_CHECK(is_int8_linear_float(x.scalar_type()), "quantize_int8_rowwise: expected float32, float16 or bfloat16, got ", x.scalar_type());
+    const int64_t K = x.size(-1);
+    TORCH_CHECK(K > 0, "quantize_int8_rowwise: the last dimension is empty");
+    at::Tensor x2 = x.reshape({-1, K});
+    if (x2.stride(1) != 1) x2 = x2.contiguous();
+    const int64_t M = x2.size(0);
+    TORCH_CHECK(M <= UINT32_MAX && K <= UINT32_MAX && x2.stride(0) <= UINT32_MAX, "quantize_int8_rowwise: tensor too large");
+
+    std::vector<int64_t> scale_shape(x.sizes().begin(), x.sizes().end());
+    scale_shape.back() = 1;
+    at::Tensor q = at::empty(x.sizes(), x.options().dtype(at::kChar));
+    at::Tensor scale = at::empty(scale_shape, x.options().dtype(at::kFloat));
+    if (M == 0) return {q, scale};
+
+    DeviceContext* device = get_device_context(x);
+    const uint32_t sg = device->default_subgroup_size;
+    const uint32_t wg = 256;
+    TORCH_CHECK(sg >= 4 && wg % sg == 0, "quantize_int8_rowwise: unsupported subgroup size ", sg);
+    // the smallest normal of x's dtype, which comfy_kitchen uses for a scale that rounds to zero
+    const float scale_min = x.scalar_type() == at::kHalf ? 6.103515625e-05f : std::numeric_limits<float>::min();
+
+    SpecializationBuilder spec{};
+    spec.push(wg).push(sg);
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(x2))
+       .push(get_tensor_address(q))
+       .push(get_tensor_address(scale))
+       .push(static_cast<uint32_t>(x2.stride(0)))
+       .push(static_cast<uint32_t>(K))
+       .push(scale_min)
+       .push(static_cast<uint32_t>(M));
+    const uint32_t groups_x = static_cast<uint32_t>(std::min<int64_t>(M, 65535));
+    const uint32_t groups_y = static_cast<uint32_t>((M + 65534) / 65535);
+    device->shader_manager->dispatchShader(ShaderKey{torchvulkan::Kernel::QUANTIZE_INT8_ROWS, x.scalar_type()}, sg,
+        spec.build(), pcs.build(), {x2}, {q, scale}, groups_x, groups_y, 1);
+    return {q, scale};
+}
+
 } // namespace
+
+TORCH_LIBRARY(torchvulkan, m) {
+    m.def("int8_scaled_mm(Tensor a, Tensor b, Tensor a_scale, Tensor b_scale, Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor");
+    m.def("quantize_int8_rowwise(Tensor x) -> (Tensor, Tensor)");
+}
+
+TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
+    m.impl("int8_scaled_mm", &int8_scaled_mm_vulkan);
+    m.impl("quantize_int8_rowwise", &quantize_int8_rowwise_vulkan);
+}
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("mm", &mm_vulkan);

@@ -577,3 +577,103 @@ void int_mm_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK 
     if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, int32_t, int32_t, VEC, BLOCK, KB>(wg, ti, pcs);
     else coopMatmulDirect<T, int32_t, int32_t, BLOCK, KB>(wg, ti, pcs);
 }
+
+// int8 x int8 -> int32 on cooperative matrices, then a scaled output in the int8 linear's dtype:
+//   out[r, c] = TOut(float(acc[r, c]) * (x_scale[r] * w_scale[c or 0]))      (+ bias[c], added in TOut)
+// Each 16 x 16 accumulator block goes through shared memory and is written element by element, so
+// the int32 product never reaches device memory and partial tiles need no padded scratch tensor.
+// The order of operations matches comfy_kitchen's eager int8_linear, so the results are the same.
+public struct Int8ScaledPushConstants
+{
+    public uint64_t tensor_a;        // int8 [M, K]
+    public uint64_t tensor_b;        // int8 [K, N] (usually a transposed [N, K] weight)
+    public uint64_t tensor_out;      // TOut [M, N], rows `out_row_stride` apart
+    public uint64_t tensor_bias;     // TOut [N], or 0
+    public uint64_t tensor_x_scale;  // float [M]
+    public uint64_t tensor_w_scale;  // float [1], or [N] when w_scale_per_channel
+    public TensorStrides strides_a;
+    public TensorStrides strides_b;
+    public uint out_row_stride;
+    public uint m_dim;
+    public uint n_dim;
+    public uint k_dim;
+    public uint w_scale_per_channel;
+    public uint padding0;
+    public uint padding1;
+    public uint padding2;
+}
+
+// one 16 x 16 int32 block per subgroup
+static groupshared int32_t epilogueStage[WARPS_M * WARPS_N * 256];
+
+void finishScaled<TOut : ITorchVulkan, let BLOCK : uint>(
+    uint ti, CoopTile tile, Int8ScaledPushConstants p, inout Accumulator<int32_t, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N])
+{
+    TOut* tensor_out = (TOut*)p.tensor_out;
+    TOut* tensor_bias = (TOut*)p.tensor_bias;
+    float* x_scale = (float*)p.tensor_x_scale;
+    float* w_scale = (float*)p.tensor_w_scale;
+    const uint lane = ti % SUBGROUP_SIZE;
+    const uint base = (ti / SUBGROUP_SIZE) * BLOCK * BLOCK;
+
+    [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
+    {
+        [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj)
+        {
+            uint row0 = tile.tile_m + tile.warp_row_base + mi * BLOCK;
+            uint col0 = tile.tile_n + tile.warp_col_base + nj * BLOCK;
+
+            // every subgroup runs the same number of blocks, so whole-workgroup barriers are safe here
+            GroupMemoryBarrierWithGroupSync();
+            acc[mi * WARP_FRAGS_N + nj].Store<linalg::CoopMatMatrixLayout.RowMajor>(epilogueStage, base, BLOCK);
+            GroupMemoryBarrierWithGroupSync();
+
+            for (uint e = lane; e < BLOCK * BLOCK; e += SUBGROUP_SIZE)
+            {
+                uint r = row0 + e / BLOCK;
+                uint c = col0 + e % BLOCK;
+                if (r >= p.m_dim || c >= p.n_dim) continue;
+                float s = x_scale[r] * w_scale[p.w_scale_per_channel != 0 ? c : 0];
+                TOut v = castValue<float, TOut>(float(epilogueStage[base + e]) * s);
+                // added in TOut, after the rounding to TOut (a float add of the widened values lets the
+                // compiler fold that rounding away for float16)
+                if (p.tensor_bias != 0) v = TOut.ext_add(v, tensor_bias[c]);
+                tensor_out[r * p.out_row_stride + c] = v;
+            }
+        }
+    }
+}
+
+// TOut is the output dtype; the inputs are int8. VEC is int8's vector width (4).
+[shader("compute")]
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void int8_mm_scaled_coop_main<TOut : ITorchVulkan, let VEC : int, let BLOCK : uint, let KB : uint>(
+    uint3 wg : SV_GroupID,
+    uint ti : SV_GroupIndex,
+    uniform Int8ScaledPushConstants p)
+{
+    CoopPushConstants<int32_t> pcs;
+    pcs.tensor_a = p.tensor_a;
+    pcs.tensor_b = p.tensor_b;
+    pcs.tensor_out = 0;
+    pcs.tensor_bias = 0;
+    pcs.strides_a = p.strides_a;
+    pcs.strides_b = p.strides_b;
+    pcs.strides_out = {};
+    pcs.strides_bias = {};
+    pcs.m_dim = p.m_dim;
+    pcs.n_dim = p.n_dim;
+    pcs.k_dim = p.k_dim;
+    pcs.padding = 0;
+    pcs.alpha = 1;
+    pcs.beta = 0;
+
+    CoopTile tile = makeTile<int32_t, BLOCK>(wg, ti, pcs);
+    Accumulator<int32_t, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N];
+    [unroll] for (uint i = 0; i < WARP_FRAGS_M * WARP_FRAGS_N; ++i) acc[i] = Accumulator<int32_t, BLOCK>(0);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (USE_SHARED_MEMORY == 1) accumulateStaged<int8_t, int32_t, int32_t, VEC, BLOCK, KB>(ti, tile, pcs, acc);
+    else accumulateDirect<int8_t, int32_t, int32_t, BLOCK, KB>(ti, tile, pcs, acc);
+    finishScaled<TOut, BLOCK>(ti, tile, p, acc);
+}

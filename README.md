@@ -173,6 +173,19 @@ Set `TORCHVULKAN_STRICT=1` to turn those silent fallbacks into errors. This is u
 TORCHVULKAN_STRICT=1 python your_script.py
 ```
 
+## Fused int8 linear ops
+
+Quantized models (such as ComfyUI's int8 checkpoints through comfy_kitchen) run a linear layer as row-wise quantization of the activations, `torch._int_mm`, then a rescale to the output dtype. torchvulkan has two ops that fuse those steps:
+
+```python
+# x [..., K] float32/float16/bfloat16 -> int8 [..., K] and float32 scales [..., 1]
+x8, x_scale = torch.ops.torchvulkan.quantize_int8_rowwise(x)
+# (_int_mm(x8, w8.t()).float() * (x_scale * w_scale)).to(out_dtype) + bias, in one kernel
+out = torch.ops.torchvulkan.int8_scaled_mm(x8, w8.t(), x_scale, w_scale, bias, torch.bfloat16)
+```
+
+`w_scale` is a single value or one per output channel. Both ops give the same results as those steps run one by one on the CPU. On GPUs with int8 cooperative matrices, `int8_scaled_mm` scales the int32 results as they leave the matrix units, so they never go through device memory; elsewhere it runs the steps as separate kernels.
+
 ## Environment variables
 
 | Variable | Effect |
