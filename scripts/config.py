@@ -153,7 +153,10 @@ KERNELS = [
         Entry('int_mm_main', [I8]),
     ]),
     Kernel('int_mm_coop_16', 'ops/matmul_coop.slang', [
-        Entry('int_mm_coop_main', [I8], ('vec',), constants=(16,)),
+        Entry('int_mm_coop_main', [I8], ('vec',), constants=(16, 16)),
+    ]),
+    Kernel('int_mm_coop_16x32', 'ops/matmul_coop.slang', [  # NVIDIA's int8 fragments are 16 x 16 x 32
+        Entry('int_mm_coop_main', [I8], ('vec',), constants=(16, 32)),
     ]),
     Kernel('resample_u8', 'ops/resample_u8.slang', [
         Entry('resample_u8_main', [U8]),

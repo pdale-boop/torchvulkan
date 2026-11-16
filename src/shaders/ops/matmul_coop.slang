@@ -77,10 +77,12 @@ typealias Accumulator<U : __BuiltinArithmeticType, let BLOCK : uint> =
     linalg::CoopMat<U, MemoryScope.Subgroup, BLOCK, BLOCK, linalg::CoopMatMatrixUse.MatrixAccumulator>;
 typealias Output<T : ICoopElement, let BLOCK : uint> =
     linalg::CoopMat<T, MemoryScope.Subgroup, BLOCK, BLOCK, linalg::CoopMatMatrixUse.MatrixAccumulator>;
-typealias FragmentA<T : ICoopElement, let BLOCK : uint> =
-    linalg::CoopMat<T, MemoryScope.Subgroup, BLOCK, BLOCK, linalg::CoopMatMatrixUse.MatrixA>;
-typealias FragmentB<T : ICoopElement, let BLOCK : uint> =
-    linalg::CoopMat<T, MemoryScope.Subgroup, BLOCK, BLOCK, linalg::CoopMatMatrixUse.MatrixB>;
+// A is BLOCK x KB and B is KB x BLOCK. KB is BLOCK for the float kernels; int8 also comes in
+// 16 x 16 x 32 (NVIDIA's only int8 shape), where a K step covers 32.
+typealias FragmentA<T : ICoopElement, let BLOCK : uint, let KB : uint> =
+    linalg::CoopMat<T, MemoryScope.Subgroup, BLOCK, KB, linalg::CoopMatMatrixUse.MatrixA>;
+typealias FragmentB<T : ICoopElement, let KB : uint, let BLOCK : uint> =
+    linalg::CoopMat<T, MemoryScope.Subgroup, KB, BLOCK, linalg::CoopMatMatrixUse.MatrixB>;
 
 struct CoopTile
 {
@@ -250,7 +252,7 @@ void stageTile<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType &
     }
 }
 
-void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint>(
+void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint, let KB : uint>(
     uint ti, CoopTile tile, CoopPushConstants<TAcc> pcs, inout Accumulator<TAcc, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
     uint smem_a_rows = WARPS_M * WARP_FRAGS_M * BLOCK;
@@ -277,16 +279,16 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
         uint current_smem_a_offset = stage * smem_a_size;
         uint current_smem_b_offset = stage * smem_b_size;
 
-        for (uint step = 0; step < BK; step += BLOCK)
+        for (uint step = 0; step < BK; step += KB)
         {
-            FragmentA<T, BLOCK> matA[WARP_FRAGS_M];
+            FragmentA<T, BLOCK, KB> matA[WARP_FRAGS_M];
             [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
             {
                 uint off = current_smem_a_offset + (tile.warp_row_base + mi * BLOCK) * (BK + PAD) + step;
                 matA[mi] = matA[mi].Load<linalg::CoopMatMatrixLayout.RowMajor>(Shared<T>.smemA, off, BK + PAD);
             }
 
-            FragmentB<T, BLOCK> matB[WARP_FRAGS_N];
+            FragmentB<T, KB, BLOCK> matB[WARP_FRAGS_N];
             [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj)
             {
                 if (b_colmajor)
@@ -316,41 +318,41 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
     }
 }
 
-FragmentA<T, BLOCK> loadA<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint row, uint k)
+FragmentA<T, BLOCK, KB> loadA<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let KB : uint>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint row, uint k)
 {
     T* tensor_a = (T*)pcs.tensor_a;
     uint idx = tile.batch_offset_a + row * pcs.strides_a.row + k * pcs.strides_a.col;
 
-    FragmentA<T, BLOCK> m;
+    FragmentA<T, BLOCK, KB> m;
     if (A_TRANSPOSED == 1) return m.Load<linalg::CoopMatMatrixLayout.ColumnMajor>(tensor_a, idx, pcs.strides_a.col);
     return m.Load<linalg::CoopMatMatrixLayout.RowMajor>(tensor_a, idx, pcs.strides_a.row);
 }
 
-FragmentB<T, BLOCK> loadB<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint k, uint col)
+FragmentB<T, KB, BLOCK> loadB<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let KB : uint>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint k, uint col)
 {
     T* tensor_b = (T*)pcs.tensor_b;
     uint idx = tile.batch_offset_b + k * pcs.strides_b.row + col * pcs.strides_b.col;
 
-    FragmentB<T, BLOCK> m;
+    FragmentB<T, KB, BLOCK> m;
     if (B_TRANSPOSED == 1) return m.Load<linalg::CoopMatMatrixLayout.ColumnMajor>(tensor_b, idx, pcs.strides_b.col);
     return m.Load<linalg::CoopMatMatrixLayout.RowMajor>(tensor_b, idx, pcs.strides_b.row);
 }
 
 // STEPS slices of K: all loads first, then all multiplies, so the loads overlap
-void accumulateSteps<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let STEPS : uint>(
+void accumulateSteps<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let KB : uint, let STEPS : uint>(
     CoopTile tile, CoopPushConstants<TAcc> pcs, uint a_rows[WARP_FRAGS_M], uint b_cols[WARP_FRAGS_N], uint k,
     inout Accumulator<TAcc, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
-    FragmentA<T, BLOCK> matA[STEPS][WARP_FRAGS_M];
+    FragmentA<T, BLOCK, KB> matA[STEPS][WARP_FRAGS_M];
     [ForceUnroll] for (uint s = 0; s < STEPS; ++s)
     {
-        [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi) matA[s][mi] = loadA<T, TAcc, TOut, BLOCK>(tile, pcs, a_rows[mi], k + s * BLOCK);
+        [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi) matA[s][mi] = loadA<T, TAcc, TOut, BLOCK, KB>(tile, pcs, a_rows[mi], k + s * KB);
     }
 
-    FragmentB<T, BLOCK> matB[STEPS][WARP_FRAGS_N];
+    FragmentB<T, KB, BLOCK> matB[STEPS][WARP_FRAGS_N];
     [ForceUnroll] for (uint s = 0; s < STEPS; ++s)
     {
-        [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj) matB[s][nj] = loadB<T, TAcc, TOut, BLOCK>(tile, pcs, k + s * BLOCK, b_cols[nj]);
+        [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj) matB[s][nj] = loadB<T, TAcc, TOut, BLOCK, KB>(tile, pcs, k + s * KB, b_cols[nj]);
     }
 
     [ForceUnroll] for (uint s = 0; s < STEPS; ++s)
@@ -366,7 +368,7 @@ void accumulateSteps<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmetic
     }
 }
 
-void accumulateDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint>(
+void accumulateDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let KB : uint>(
     uint ti, CoopTile tile, CoopPushConstants<TAcc> pcs, inout Accumulator<TAcc, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
     T* tensor_a = (T*)pcs.tensor_a;
@@ -388,10 +390,10 @@ void accumulateDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
     uint k_main_end = (pcs.k_dim / BK) * BK;
     uint k = 0;
 
-    for (; k + 8 * BLOCK <= k_main_end; k += 8 * BLOCK) accumulateSteps<T, TAcc, TOut, BLOCK, 8>(tile, pcs, a_rows, b_cols, k, acc);
-    for (; k + 4 * BLOCK <= k_main_end; k += 4 * BLOCK) accumulateSteps<T, TAcc, TOut, BLOCK, 4>(tile, pcs, a_rows, b_cols, k, acc);
-    for (; k + 2 * BLOCK <= k_main_end; k += 2 * BLOCK) accumulateSteps<T, TAcc, TOut, BLOCK, 2>(tile, pcs, a_rows, b_cols, k, acc);
-    for (; k + BLOCK <= k_main_end; k += BLOCK) accumulateSteps<T, TAcc, TOut, BLOCK, 1>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + 8 * KB <= k_main_end; k += 8 * KB) accumulateSteps<T, TAcc, TOut, BLOCK, KB, 8>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + 4 * KB <= k_main_end; k += 4 * KB) accumulateSteps<T, TAcc, TOut, BLOCK, KB, 4>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + 2 * KB <= k_main_end; k += 2 * KB) accumulateSteps<T, TAcc, TOut, BLOCK, KB, 2>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + KB <= k_main_end; k += KB) accumulateSteps<T, TAcc, TOut, BLOCK, KB, 1>(tile, pcs, a_rows, b_cols, k, acc);
 
     if (k >= pcs.k_dim) return;
 
@@ -428,16 +430,16 @@ void accumulateDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
 
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint step = 0; step < BK; step += BLOCK)
+    for (uint step = 0; step < BK; step += KB)
     {
-        FragmentA<T, BLOCK> matA[WARP_FRAGS_M];
+        FragmentA<T, BLOCK, KB> matA[WARP_FRAGS_M];
         [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
         {
             uint off = (tile.warp_row_base + mi * BLOCK) * BK + step;
             matA[mi] = matA[mi].Load<linalg::CoopMatMatrixLayout.RowMajor>(Shared<T>.smemA, off, BK);
         }
 
-        FragmentB<T, BLOCK> matB[WARP_FRAGS_N];
+        FragmentB<T, KB, BLOCK> matB[WARP_FRAGS_N];
         [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj)
         {
             uint off = step * smem_b_cols + (tile.warp_col_base + nj * BLOCK);
@@ -526,7 +528,7 @@ void finishTile<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType 
     }
 }
 
-void coopMatmulStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint>(
+void coopMatmulStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint, let KB : uint>(
     uint3 wg, uint ti, CoopPushConstants<TAcc> pcs)
 {
     CoopTile tile = makeTile<TAcc, BLOCK>(wg, ti, pcs);
@@ -535,11 +537,11 @@ void coopMatmulStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
     [unroll] for (uint i = 0; i < WARP_FRAGS_M * WARP_FRAGS_N; ++i) acc[i] = Accumulator<TAcc, BLOCK>(TAcc.ext_zero());
     GroupMemoryBarrierWithGroupSync();
 
-    accumulateStaged<T, TAcc, TOut, VEC, BLOCK>(ti, tile, pcs, acc);
+    accumulateStaged<T, TAcc, TOut, VEC, BLOCK, KB>(ti, tile, pcs, acc);
     finishTile<T, TAcc, TOut, BLOCK>(wg, tile, pcs, acc);
 }
 
-void coopMatmulDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint>(
+void coopMatmulDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, TOut : ITorchVulkan & ICoopElement, let BLOCK : uint, let KB : uint>(
     uint3 wg, uint ti, CoopPushConstants<TAcc> pcs)
 {
     CoopTile tile = makeTile<TAcc, BLOCK>(wg, ti, pcs);
@@ -548,7 +550,7 @@ void coopMatmulDirect<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
     [unroll] for (uint i = 0; i < WARP_FRAGS_M * WARP_FRAGS_N; ++i) acc[i] = Accumulator<TAcc, BLOCK>(TAcc.ext_zero());
     GroupMemoryBarrierWithGroupSync();
 
-    accumulateDirect<T, TAcc, TOut, BLOCK>(ti, tile, pcs, acc);
+    accumulateDirect<T, TAcc, TOut, BLOCK, KB>(ti, tile, pcs, acc);
     finishTile<T, TAcc, TOut, BLOCK>(wg, tile, pcs, acc);
 }
 
@@ -559,18 +561,19 @@ void matmul_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK 
     uint ti : SV_GroupIndex,
     uniform CoopPushConstants<T.Accum> pcs)
 {
-    if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, T.Accum, T, VEC, BLOCK>(wg, ti, pcs);
-    else coopMatmulDirect<T, T.Accum, T, BLOCK>(wg, ti, pcs);
+    if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, T.Accum, T, VEC, BLOCK, BLOCK>(wg, ti, pcs);
+    else coopMatmulDirect<T, T.Accum, T, BLOCK, BLOCK>(wg, ti, pcs);
 }
 
-// torch._int_mm: int8 A and B, accumulated and stored as int32 (no alpha/beta/bias)
+// torch._int_mm: int8 A and B, accumulated and stored as int32 (no alpha/beta/bias).
+// BLOCK x BLOCK x KB fragments: 16 x 16 x 16 (RDNA3/4) or 16 x 16 x 32 (NVIDIA).
 [shader("compute")]
 [numthreads(WORKGROUP_SIZE, 1, 1)]
-void int_mm_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint>(
+void int_mm_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK : uint, let KB : uint>(
     uint3 wg : SV_GroupID,
     uint ti : SV_GroupIndex,
     uniform CoopPushConstants<int32_t> pcs)
 {
-    if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, int32_t, int32_t, VEC, BLOCK>(wg, ti, pcs);
-    else coopMatmulDirect<T, int32_t, int32_t, BLOCK>(wg, ti, pcs);
+    if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, int32_t, int32_t, VEC, BLOCK, KB>(wg, ti, pcs);
+    else coopMatmulDirect<T, int32_t, int32_t, BLOCK, KB>(wg, ti, pcs);
 }

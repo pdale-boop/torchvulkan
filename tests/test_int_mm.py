@@ -54,7 +54,8 @@ def test_int_mm_matches_cpu(m, k, n, layout, kernel_path):
 
 
 # whole tiles (the result is stored straight into the output), K tails of every size
-# below the 16-deep fragment, and a K that is not a multiple of the staged K step
+# below the 16-deep fragment, and a K that is not a multiple of the staged K step;
+# K around 32 and its multiples covers the 32-deep fragments NVIDIA uses for int8
 @pytest.mark.parametrize('m,k,n', [
     (128, 256, 128),
     (256, 512, 512),
@@ -63,6 +64,10 @@ def test_int_mm_matches_cpu(m, k, n, layout, kernel_path):
     (32, 15, 48),
     (96, 4095, 80),
     (5, 4096, 3),
+    (48, 31, 64),
+    (64, 48, 96),
+    (80, 63, 72),
+    (128, 96, 128),
 ])
 @pytest.mark.parametrize('layout', ['contiguous', 'transposed_b'])
 def test_int_mm_tile_and_k_edges(m, k, n, layout, kernel_path):

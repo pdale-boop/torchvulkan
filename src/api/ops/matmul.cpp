@@ -576,13 +576,15 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     if (!device->support_coopmat) return false;
     if (const char* env = std::getenv("TORCHVULKAN_INT_MM_SCALAR"); env && env[0] != '\0' && env[0] != '0') return false;
 
-    // only the 16x16x16 shape is compiled for int8 (see scripts/config.py)
+    // int8 fragments are compiled as 16x16x16 (RDNA3/4) and 16x16x32 (NVIDIA, which has no K = 16
+    // int8 shape); see scripts/config.py. kb is the K step of one fragment.
     const uint32_t block = 16;
-    bool has_block = false;
+    uint32_t kb = 0;
     for (const CoopMatConfig& c : device->cache.getCoopMatConfig(at::kChar, at::kChar, at::kInt, at::kInt)) {
-        if (c.m == block && c.n == block && c.k == block) has_block = true;
+        if (c.m == block && c.n == block && (c.k == 16 || c.k == 32) && (kb == 0 || c.k < kb)) kb = c.k;
     }
-    if (!has_block) return false;
+    if (kb == 0) return false;
+    const torchvulkan::Kernel coop_kernel = kb == 16 ? torchvulkan::Kernel::INT_MM_COOP_16 : torchvulkan::Kernel::INT_MM_COOP_16X32;
 
     const uint32_t M = static_cast<uint32_t>(self.size(0));
     const uint32_t K = static_cast<uint32_t>(self.size(1));
@@ -615,9 +617,11 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     // reads only 16 contiguous bytes of each column, so it defaults to 32; a row-major B to the
     // tiling's own BK
     const bool b_is_transposed = mat2.stride(1) != 1 && mat2.stride(0) == 1;
-    const uint32_t default_bk = (params.use_shared_memory && b_is_transposed) ? 32 : params.bk;
+    // (a K step is a whole number of fragments)
+    uint32_t default_bk = (params.use_shared_memory && b_is_transposed) ? 32 : params.bk;
+    default_bk = ((std::max(default_bk, kb) + kb - 1) / kb) * kb;
     auto bk_fits = [&](uint32_t bk, uint32_t pad) {
-        return bk >= block && bk % block == 0 && (!params.use_shared_memory || int_mm_shared_bytes(params, block, bk, pad) <= max_smem);
+        return bk >= kb && bk % kb == 0 && (!params.use_shared_memory || int_mm_shared_bytes(params, block, bk, pad) <= max_smem);
     };
 
     auto coop_loadable = [](const at::Tensor& t) { return t.stride(-1) == 1 || t.stride(-2) == 1; };
@@ -660,7 +664,7 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     auto make_dispatch = [&](uint32_t bk, uint32_t pad) {
         const uint32_t a_vec_aligned = (!a_transposed && strides_a[1] % vec == 0 && strides_a[0] % vec == 0 && bk % vec == 0) ? 1 : 0;
         TuneDispatch d;
-        d.key = ShaderKey{torchvulkan::Kernel::INT_MM_COOP_16, at::kChar};
+        d.key = ShaderKey{coop_kernel, at::kChar};
         d.subgroupSize = params.subgroup_size;
         d.spec.push(params.workgroup_size)
               .push(params.subgroup_size)
@@ -715,14 +719,16 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     if (tune) {
         TuneSpace space;
         std::vector<uint32_t> pads = pad_env && pad_env[0] ? std::vector<uint32_t>{pad} : std::vector<uint32_t>{4, 16};
-        std::vector<uint32_t> bks = bk_env && bk_env[0] ? std::vector<uint32_t>{bk} : std::vector<uint32_t>{default_bk, default_bk == 32 ? 16u : 32u};
+        // with 16-deep fragments the alternative K step is 16 or 32; with 32-deep ones it is 64
+        const uint32_t other_bk = kb == 32 ? (default_bk == 64 ? 32u : 64u) : (default_bk == 32 ? 16u : 32u);
+        std::vector<uint32_t> bks = bk_env && bk_env[0] ? std::vector<uint32_t>{bk} : std::vector<uint32_t>{default_bk, other_bk};
         space.params = {{"pad", pads}, {"bk", bks}};
         space.valid = [&](const TuneConfig& cfg) { return bk_fits(cfg[1], cfg[0]); };
         auto bucket = [](uint32_t x) -> uint64_t { uint64_t b = 1; while (b < x && b < 4096) b <<= 1; return b; };
         const uint64_t tuned_id = bucket(M) | (bucket(N) << 16) | (bucket(K) << 32) |
                                   ((uint64_t)a_transposed << 48) | ((uint64_t)b_transposed << 49) |
                                   ((uint64_t)params.subgroup_size << 50);
-        const TuneConfig& chosen = device->tuner->select(ShaderKey{torchvulkan::Kernel::INT_MM_COOP_16, at::kChar}, tuned_id, space,
+        const TuneConfig& chosen = device->tuner->select(ShaderKey{coop_kernel, at::kChar}, tuned_id, space,
             [&](const TuneConfig& cfg) { return make_dispatch(cfg[1], cfg[0]); });
         if (!chosen.empty()) { pad = chosen[0]; bk = chosen[1]; }
     }
@@ -733,8 +739,8 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
     device->shader_manager->dispatchShader(d.key, d.subgroupSize, d.spec.build(), d.push.build(), d.read, d.write, d.groupX, d.groupY, d.groupZ);
 
     if (std::getenv("TORCHVULKAN_INT_MM_DEBUG")) {
-        fprintf(stderr, "torchvulkan: _int_mm coop M=%u N=%u K=%u wg=%u sg=%u warps=%ux%u frags=%ux%u bk=%u pad=%u smem=%d at=%u bt=%u direct=%d tuned=%d\n",
-            M, N, K, params.workgroup_size, params.subgroup_size, params.warps_m, params.warps_n, params.warp_frags_m, params.warp_frags_n,
+        fprintf(stderr, "torchvulkan: _int_mm coop 16x16x%u M=%u N=%u K=%u wg=%u sg=%u warps=%ux%u frags=%ux%u bk=%u pad=%u smem=%d at=%u bt=%u direct=%d tuned=%d\n",
+            kb, M, N, K, params.workgroup_size, params.subgroup_size, params.warps_m, params.warps_n, params.warp_frags_m, params.warp_frags_n,
             params.bk, pad, (int)params.use_shared_memory, a_transposed, b_transposed, (int)direct, (int)tune);
     }
 
