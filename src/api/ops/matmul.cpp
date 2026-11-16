@@ -576,6 +576,9 @@ uint64_t int_mm_shared_bytes(const CoopMatParams& params, uint32_t block, uint32
 // The scaled output of an int8 linear (torchvulkan::int8_scaled_mm), applied by int_mm_coop as each
 // block of int32 results leaves the cooperative matrices: out = (acc * (x_scale[row] * w_scale[col]))
 // in out's dtype, plus bias. x_scale is float [M], w_scale float [1] or [N], bias out's dtype [N].
+// FLOAT_KIND of the int8 linear shaders (core/rounding.slang): 0 float32, 1 float16, 2 bfloat16
+uint32_t float_kind(at::ScalarType t) { return t == at::kHalf ? 1 : t == at::kBFloat16 ? 2 : 0; }
+
 struct Int8ScaledOutput
 {
     at::Tensor x_scale;
@@ -714,6 +717,7 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
               .push(b_transposed) // B_SMEM_COLMAJOR
               .push(pad);         // PAD
         if (scaled) {
+            d.spec.push(float_kind(out.scalar_type())); // OUT_KIND
             // Int8ScaledPushConstants
             const at::Tensor& bias = scaled->bias ? *scaled->bias : at::Tensor();
             d.push.push(get_tensor_address(a))
@@ -771,7 +775,10 @@ bool int_mm_coop(const at::Tensor& self, const at::Tensor& mat2, at::Tensor& out
         TuneSpace space;
         std::vector<uint32_t> pads = pad_env && pad_env[0] ? std::vector<uint32_t>{pad} : std::vector<uint32_t>{4, 16};
         // with 16-deep fragments the alternative K step is 16 or 32; with 32-deep ones it is 64
-        const uint32_t other_bk = kb == 32 ? (default_bk == 64 ? 32u : 64u) : (default_bk == 32 ? 16u : 32u);
+        // A transposed B with a 16-deep K step gives all-zero results on the RDNA2 iGPU (only with
+        // padded shared-memory rows, so the cause is in the staging), so a transposed B tries 64.
+        uint32_t other_bk = kb == 32 ? (default_bk == 64 ? 32u : 64u) : (default_bk == 32 ? 16u : 32u);
+        if (b_is_transposed && other_bk == 16) other_bk = 64;
         std::vector<uint32_t> bks = bk_env && bk_env[0] ? std::vector<uint32_t>{bk} : std::vector<uint32_t>{default_bk, other_bk};
         space.params = {{"pad", pads}, {"bk", bks}};
         space.valid = [&](const TuneConfig& cfg) { return bk_fits(cfg[1], cfg[0]); };
@@ -923,7 +930,7 @@ std::tuple<at::Tensor, at::Tensor> quantize_int8_rowwise_vulkan(const at::Tensor
     const float scale_min = x.scalar_type() == at::kHalf ? 6.103515625e-05f : std::numeric_limits<float>::min();
 
     SpecializationBuilder spec{};
-    spec.push(wg).push(sg);
+    spec.push(wg).push(sg).push(float_kind(x.scalar_type()));
     PushConstantBuilder pcs{};
     pcs.push(get_tensor_address(x2))
        .push(get_tensor_address(q))

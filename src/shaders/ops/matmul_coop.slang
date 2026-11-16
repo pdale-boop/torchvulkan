@@ -1,6 +1,7 @@
 module matmul_coop;
 
 __exported import core.dtype;
+import core.rounding;
 
 [[vk::constant_id(0)]] public const uint WORKGROUP_SIZE = 128;
 [[vk::constant_id(1)]] public const uint SUBGROUP_SIZE = 32;
@@ -582,7 +583,8 @@ void int_mm_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int, let BLOCK 
 //   out[r, c] = TOut(float(acc[r, c]) * (x_scale[r] * w_scale[c or 0]))      (+ bias[c], added in TOut)
 // Each 16 x 16 accumulator block goes through shared memory and is written element by element, so
 // the int32 product never reaches device memory and partial tiles need no padded scratch tensor.
-// The order of operations matches comfy_kitchen's eager int8_linear, so the results are the same.
+// The order of operations matches comfy_kitchen's eager int8_linear, and 16-bit outputs are rounded
+// by core.rounding rather than the driver's conversion, so the results are the CPU's.
 public struct Int8ScaledPushConstants
 {
     public uint64_t tensor_a;        // int8 [M, K]
@@ -603,14 +605,20 @@ public struct Int8ScaledPushConstants
     public uint padding2;
 }
 
+// the scaled output's dtype: 0 float32, 1 float16, 2 bfloat16 (see core.rounding)
+[[vk::constant_id(22)]] public const uint OUT_KIND = 0;
+
 // one 16 x 16 int32 block per subgroup
 static groupshared int32_t epilogueStage[WARPS_M * WARPS_N * 256];
 
 void finishScaled<TOut : ITorchVulkan, let BLOCK : uint>(
     uint ti, CoopTile tile, Int8ScaledPushConstants p, inout Accumulator<int32_t, BLOCK> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
-    TOut* tensor_out = (TOut*)p.tensor_out;
-    TOut* tensor_bias = (TOut*)p.tensor_bias;
+    // float32 output and bias as floats; 16-bit ones as bits, rounded by core.rounding
+    float* out32 = (float*)p.tensor_out;
+    float* bias32 = (float*)p.tensor_bias;
+    uint16_t* out16 = (uint16_t*)p.tensor_out;
+    uint16_t* bias16 = (uint16_t*)p.tensor_bias;
     float* x_scale = (float*)p.tensor_x_scale;
     float* w_scale = (float*)p.tensor_w_scale;
     const uint lane = ti % SUBGROUP_SIZE;
@@ -634,11 +642,21 @@ void finishScaled<TOut : ITorchVulkan, let BLOCK : uint>(
                 uint c = col0 + e % BLOCK;
                 if (r >= p.m_dim || c >= p.n_dim) continue;
                 float s = x_scale[r] * w_scale[p.w_scale_per_channel != 0 ? c : 0];
-                TOut v = castValue<float, TOut>(float(epilogueStage[base + e]) * s);
-                // added in TOut, after the rounding to TOut (a float add of the widened values lets the
-                // compiler fold that rounding away for float16)
-                if (p.tensor_bias != 0) v = TOut.ext_add(v, tensor_bias[c]);
-                tensor_out[r * p.out_row_stride + c] = v;
+                precise float v = float(epilogueStage[base + e]) * s;
+                uint idx = r * p.out_row_stride + c;
+                if (OUT_KIND == 0)
+                {
+                    if (p.tensor_bias != 0) v = v + bias32[c];
+                    out32[idx] = v;
+                }
+                else
+                {
+                    // rounded to the output dtype, then the bias added and rounded again, as in
+                    // PyTorch's `result.to(dtype) + bias`
+                    uint16_t h = floatTo16Bits(OUT_KIND, v);
+                    if (p.tensor_bias != 0) h = floatTo16Bits(OUT_KIND, bits16ToFloat(OUT_KIND, h) + bits16ToFloat(OUT_KIND, bias16[c]));
+                    out16[idx] = h;
+                }
             }
         }
     }
