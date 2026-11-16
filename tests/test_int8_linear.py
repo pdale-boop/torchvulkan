@@ -77,13 +77,23 @@ def test_int8_scaled_mm(kernel_path, dtype, m, k, n, per_channel, with_bias):
     bias = torch.randn(n, generator=g).to(dtype) if with_bias else None
 
     expected = (torch._int_mm(a, w.t()).float() * (a_scale * w_scale.reshape(1, -1))).to(dtype)
+    magnitude = expected.float().abs()
     if bias is not None:
         expected = expected + bias
+        magnitude = magnitude + bias.float().abs()
     result = torch.ops.torchvulkan.int8_scaled_mm(
         a.to(DEVICE), w.to(DEVICE).t(), a_scale.to(DEVICE), w_scale.to(DEVICE),
         None if bias is None else bias.to(DEVICE), dtype)
     assert result.dtype == dtype and result.shape == (m, n)
-    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    if kernel_path == 'scalar' and dtype == torch.float16:
+        # the fallback casts with torchvulkan's float32 -> float16 conversion, which some drivers
+        # (AMD's) round toward zero instead of to nearest: allow 1 ulp for each of the two roundings
+        # (to float16, then after the bias add), measured on the operands, not the possibly
+        # cancelled result
+        error = (result.cpu().float() - expected.float()).abs()
+        assert (error <= 2 ** -9 * magnitude + 2 ** -24).all(), f'max error {error.max().item()}'
+    else:
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
 
 
 def test_int8_scaled_mm_row_major_b():
