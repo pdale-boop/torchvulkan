@@ -3,18 +3,17 @@ module attention;
 __exported import core.dtype;
 
 // Fused attention, softmax(q @ k^T * scale) @ v, without materialising the score matrix.
-// Each workgroup owns WG_x / 4 query rows of one (batch, head). A row is shared by the
-// four lanes of a quad: lane p holds head dims p, p + 4, p + 8, ..., and dot products are
-// summed across the quad. K and V stream through shared memory in tiles of BC keys while
-// each row keeps a running max, running sum and output accumulator (the online softmax
-// from FlashAttention). D is the compiled head size; smaller heads are zero-padded.
+// Each workgroup owns WG_x / RL query rows of one (batch, head). A row is shared by RL
+// adjacent lanes: lane p holds head dims p, p + RL, p + 2 RL, ..., and dot products are
+// summed across those lanes (quad ops for RL = 4, subgroup shuffles for RL = 8). K and V
+// stream through shared memory in tiles of BC keys while each row keeps a running max,
+// running sum and output accumulator (the online softmax from FlashAttention). D is the
+// compiled head size; smaller heads are zero-padded.
 //
-// Splitting the row keeps the per-thread arrays at D / 4. With one thread per row,
-// D = 128 gave wrong results on an RDNA2 GPU for any head size above 80.
+// Splitting the row keeps the per-thread arrays at D / RL, at most 64 floats. With one
+// thread per row, D = 128 gave wrong results on an RDNA2 GPU for any head size above 80.
 
 [[vk::constant_id(0)]] public const uint WG_x = 128;
-
-static const uint ROW_LANES = 4;
 
 // q, k, v and out are contiguous [batch * heads, length, head_dim]
 public struct AttentionPushConstants
@@ -29,27 +28,35 @@ public struct AttentionPushConstants
     public float scale;
 }
 
-float quad_sum(float x)
+// Sum x over the RL lanes that share a row (RL adjacent, RL-aligned subgroup lanes).
+float row_sum<let RL : int>(float x)
 {
-    x += QuadReadAcrossX(x);
-    return x + QuadReadAcrossY(x);
+    if (RL == 4)
+    {
+        x += QuadReadAcrossX(x);
+        return x + QuadReadAcrossY(x);
+    }
+    uint lane = WaveGetLaneIndex();
+    [ForceUnroll] for (int m = 1; m < RL; m *= 2) x += WaveReadLaneAt(x, lane ^ uint(m));
+    return x;
 }
 
 [shader("compute")]
 [numthreads(WG_x, 1, 1)]
-void attention_main<T : ITorchVulkan, let D : int, let BC : int>(
+void attention_main<T : ITorchVulkan, let D : int, let BC : int, let RL : int>(
     uint3 li : SV_GroupThreadID,
     uint3 wg : SV_GroupID,
     uniform AttentionPushConstants pcs)
 {
-    static const int DL = D / ROW_LANES;   // head dims per lane
+    static const uint ROW_LANES = RL;
+    static const int DL = D / RL;   // head dims per lane
     static groupshared float k_tile[BC * D];
     static groupshared float v_tile[BC * D];
 
     uint lane = li.x;
     uint part = lane % ROW_LANES;
     uint row = wg.x * (WG_x / ROW_LANES) + lane / ROW_LANES;
-    bool valid = row < pcs.lq;   // the same for all four lanes of a row
+    bool valid = row < pcs.lq;   // the same for all lanes of a row
     uint hd = pcs.head_dim;
 
     T* q = (T*)pcs.q;
@@ -95,7 +102,7 @@ void attention_main<T : ITorchVulkan, let D : int, let BC : int>(
             {
                 float dot = 0.0;
                 [ForceUnroll] for (int i = 0; i < DL; i++) dot += q_part[i] * k_tile[j * D + i * ROW_LANES + part];
-                dot = quad_sum(dot);
+                dot = row_sum<RL>(dot);
                 s[j] = uint(j) < n ? dot : -1.0e30;
                 tile_max = max(tile_max, s[j]);
             }

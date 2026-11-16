@@ -9,9 +9,9 @@
 
 namespace {
 
-// threads per workgroup; the shader gives each query row 4 lanes, so 32 rows per workgroup
+// threads per workgroup; each query row gets 4 lanes (8 for the 512 kernel)
 constexpr uint32_t ATTENTION_WG_SIZE = 128;
-constexpr uint32_t ATTENTION_ROWS = ATTENTION_WG_SIZE / 4;
+constexpr int64_t ATTENTION_MAX_HEAD_DIM = 512;
 
 // PyTorch's own composite implementation, which is what runs without this kernel.
 // It converts boolean masks before reaching the math path, so call it rather than
@@ -26,7 +26,7 @@ at::Tensor sdpa_math(
 }
 
 // The fused kernel covers inference without a mask, dropout or causal masking, for
-// [..., length, head_dim] inputs with matching batch dims and head sizes up to 256.
+// [..., length, head_dim] inputs with matching batch dims and head sizes up to 512.
 bool fused_attention_supported(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const std::optional<at::Tensor>& attn_mask, double dropout_p, bool is_causal, bool enable_gqa)
@@ -44,7 +44,7 @@ bool fused_attention_supported(
     if (k.sizes() != v.sizes()) return false;
 
     int64_t head_dim = q.size(-1);
-    if (k.size(-1) != head_dim || head_dim > 256 || head_dim == 0) return false;
+    if (k.size(-1) != head_dim || head_dim > ATTENTION_MAX_HEAD_DIM || head_dim == 0) return false;
     if (q.size(-2) == 0 || k.size(-2) == 0) return false;
 
     // the shader indexes with 32-bit offsets
@@ -56,7 +56,14 @@ torchvulkan::Kernel attention_kernel_for(int64_t head_dim)
 {
     if (head_dim <= 64) return torchvulkan::Kernel::ATTENTION_64;
     if (head_dim <= 128) return torchvulkan::Kernel::ATTENTION_128;
-    return torchvulkan::Kernel::ATTENTION_256;
+    if (head_dim <= 256) return torchvulkan::Kernel::ATTENTION_256;
+    return torchvulkan::Kernel::ATTENTION_512;
+}
+
+// lanes per query row, matching the RL constant in scripts/config.py
+uint32_t attention_row_lanes(int64_t head_dim)
+{
+    return head_dim > 256 ? 8 : 4;
 }
 
 at::Tensor scaled_dot_product_attention_vulkan(
@@ -74,8 +81,10 @@ at::Tensor scaled_dot_product_attention_vulkan(
 
     DeviceContext* device = get_device_context(query);
     // like every other op, the dtype must be supported on the device (bf16 isn't on Turing or llvmpipe),
-    // and the shader needs quad operations
-    if (!is_dtype_supported(device, query.scalar_type()) || !device->support_subgroup_quad)
+    // and the shader needs quad operations (or shuffles, for 8 lanes per row)
+    uint32_t row_lanes = attention_row_lanes(query.size(-1));
+    bool lanes_ok = row_lanes == 4 ? device->support_subgroup_quad : device->support_subgroup_shuffle;
+    if (!is_dtype_supported(device, query.scalar_type()) || !lanes_ok)
         return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);
     int64_t lq = query.size(-2);
     int64_t lk = key.size(-2);
@@ -90,7 +99,8 @@ at::Tensor scaled_dot_product_attention_vulkan(
     at::Tensor v = value.reshape({batch_heads, lk, head_dim}).contiguous();
     at::Tensor out = at::empty({batch_heads, lq, head_dim}, q.options());
 
-    float softmax_scale = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
+    int64_t rows_per_group = ATTENTION_WG_SIZE / row_lanes;
+    float softmax_scale =scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     SpecializationBuilder spd{};
     spd.push(ATTENTION_WG_SIZE);
@@ -112,7 +122,7 @@ at::Tensor scaled_dot_product_attention_vulkan(
         pcs.build(),
         /* read = */ {q, k, v},
         /* write = */ {out},
-        static_cast<uint32_t>((lq + ATTENTION_ROWS - 1) / ATTENTION_ROWS),
+        static_cast<uint32_t>((lq + rows_per_group - 1) / rows_per_group),
         static_cast<uint32_t>(batch_heads),
         1
     );

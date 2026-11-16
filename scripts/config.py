@@ -221,14 +221,17 @@ KERNELS = [
     Kernel('distribution', 'ops/distribution.slang', [
         Entry('distribution_main', FLOATS),
     ]),
-    # fused attention, one kernel per compiled head size (constants: head size, key tile)
+    # fused attention, one kernel per compiled head size (constants: head size, key tile, lanes per row)
     Kernel('attention_64', 'ops/attention.slang', [
-        Entry('attention_main', [F32, F16, BF16], constants=(64, 32)),
+        Entry('attention_main', [F32, F16, BF16], constants=(64, 32, 4)),
     ]),
     Kernel('attention_128', 'ops/attention.slang', [
-        Entry('attention_main', [F32, F16, BF16], constants=(128, 32)),
+        Entry('attention_main', [F32, F16, BF16], constants=(128, 32, 4)),
     ]),
     Kernel('attention_256', 'ops/attention.slang', [
-        Entry('attention_main', [F32, F16, BF16], constants=(256, 16)),
+        Entry('attention_main', [F32, F16, BF16], constants=(256, 16, 4)),
+    ]),
+    Kernel('attention_512', 'ops/attention.slang', [  # VAE mid-block attention
+        Entry('attention_main', [F32, F16, BF16], constants=(512, 8, 8)),
     ]),
 ]
