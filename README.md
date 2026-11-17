@@ -163,6 +163,18 @@ torchvulkan.__version__               # package version
 
 Importing `torchvulkan` registers the backend, after which the device is addressed as `"vulkan"` / `torch.device("vulkan")` throughout PyTorch.
 
+### Fused RMS norm and rotary embedding
+
+`F.rms_norm` runs as one kernel on Vulkan tensors. Transformer attention blocks often normalise each head and then apply a rotary position embedding (RoPE); `torch.ops.torchvulkan.rms_norm_rope` does both in one pass:
+
+```python
+# x: [batch, tokens, heads, head_dim] or [batch, heads, tokens, head_dim]
+# freqs_cis: float32 2x2 rotation matrices [., ., ., head_dim / 2, 2, 2], broadcast over x
+out = torch.ops.torchvulkan.rms_norm_rope(x, weight, freqs_cis, eps=1e-6, split_half=False)
+```
+
+`split_half=False` rotates the pairs (2i, 2i+1); `True` rotates (i, i + head_dim/2). The normalised values are rounded to x's dtype before the rotation, as running `rms_norm` and then the rotation would.
+
 ## CPU fallback
 
 By default, any operation, dtype, or tensor shape the backend doesn't implement natively runs on the **CPU**, so models keep working despite partial coverage. The warning is printed once, for the first operation that falls back; call `torch.set_warn_always(True)` to see every one.

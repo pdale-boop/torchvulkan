@@ -122,6 +122,9 @@ KERNELS = [
     Kernel('scan_arg', 'ops/scan_arg.slang', [
         Entry('scan_arg_main', DTYPES),
     ]),
+    Kernel('rms_norm', 'ops/rms_norm.slang', [  # rms_norm, and torchvulkan::rms_norm_rope
+        Entry('rms_norm_main', [F32, F16, BF16]),
+    ]),
     Kernel('nllloss', 'ops/nllloss.slang', [
         Entry('nllloss_main', FLOATS),
     ]),
