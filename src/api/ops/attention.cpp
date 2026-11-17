@@ -1,7 +1,9 @@
 #include <torch/extension.h>
 #include <ATen/ops/scaled_dot_product_attention_native.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
@@ -78,16 +80,70 @@ bool env_flag(const char* name)
     return v && v[0] != '\0' && v[0] != '0';
 }
 
-// One way to run the fused attention: its dispatch, and its output [batch * heads, rows, head_dim],
-// whose first lq rows are the result.
+// One way to run the fused attention: its output [batch * heads, rows, head_dim], whose first lq
+// rows are the result, and the dispatch for any range of heads and query rows (row_start a multiple
+// of row_step), so that a large problem can run as several dispatches.
 struct AttentionPlan
 {
-    TuneDispatch dispatch;
     at::Tensor out;
     int64_t lq = 0;
+    int64_t heads = 0;
+    int64_t rows = 0;      // query rows the kernel covers (lq, or lq padded to whole workgroups)
+    int64_t row_step = 1;  // query rows per workgroup
+    std::function<TuneDispatch(int64_t head_start, int64_t head_count, int64_t row_start, int64_t row_count)> chunk;
 
     at::Tensor result() const { return out.size(1) == lq ? out : out.narrow(1, 0, lq).contiguous(); }
 };
+
+// The most work (query rows x keys x head size, summed over heads) one dispatch may do. A single
+// long dispatch can trip the GPU watchdog: the i915 preemption timeout (~640 ms) killed the context
+// on an Intel HD 530 at 16 heads x 1024 tokens, and Windows resets a GPU after 2 s (TDR). Dispatches
+// are preemption points, so the work is split by heads, then by query rows. The caps keep a dispatch
+// to ~0.25 s on an HD 530 (integrated) and under ~1 s on a slow discrete GPU, while ordinary shapes
+// stay one dispatch on a fast one. TORCHVULKAN_ATTENTION_CHUNK sets the cap in units of 2^20.
+int64_t attention_dispatch_work_cap(DeviceContext* device)
+{
+    if (const char* env = std::getenv("TORCHVULKAN_ATTENTION_CHUNK"); env && env[0])
+        return std::max<int64_t>(1, std::strtoll(env, nullptr, 10)) << 20;
+    switch (device->properties.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return int64_t(1) << 26;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU: return std::numeric_limits<int64_t>::max();  // no watchdog
+    default: return int64_t(1) << 36;
+    }
+}
+
+// heads and query rows per dispatch under the work cap
+struct AttentionSplit { int64_t heads; int64_t rows; };
+
+AttentionSplit attention_split(DeviceContext* device, const AttentionPlan& plan, int64_t lk, int64_t head_dim)
+{
+    const int64_t cap = attention_dispatch_work_cap(device);
+    const int64_t per_row = lk * head_dim;
+    if (plan.rows > cap / per_row) {
+        // one head is already too much: split its query rows
+        return {1, std::min(plan.rows, std::max<int64_t>(plan.row_step, cap / per_row / plan.row_step * plan.row_step))};
+    }
+    return {std::min(plan.heads, std::max<int64_t>(1, cap / (plan.rows * per_row))), plan.rows};
+}
+
+// the first dispatch of the split, which the autotuner times (so tuning never runs a dispatch
+// longer than the cap either)
+TuneDispatch first_attention_chunk(DeviceContext* device, const AttentionPlan& plan, int64_t lk, int64_t head_dim)
+{
+    const AttentionSplit s = attention_split(device, plan, lk, head_dim);
+    return plan.chunk(0, s.heads, 0, s.rows);
+}
+
+void run_attention(DeviceContext* device, const AttentionPlan& plan, int64_t lk, int64_t head_dim)
+{
+    const AttentionSplit s = attention_split(device, plan, lk, head_dim);
+    for (int64_t h = 0; h < plan.heads; h += s.heads) {
+        for (int64_t r = 0; r < plan.rows; r += s.rows) {
+            TuneDispatch d = plan.chunk(h, std::min(s.heads, plan.heads - h), r, std::min(s.rows, plan.rows - r));
+            device->shader_manager->dispatchShader(d.key, d.subgroupSize, d.spec.build(), d.push.build(), d.read, d.write, d.groupX, d.groupY, d.groupZ);
+        }
+    }
+}
 
 // The cooperative-matrix kernel: float16 or bfloat16, head sizes 64 and 128, on devices with 16x16x16
 // T x T -> float32 cooperative matrices and subgroup shuffles (the softmax combines lanes with them).
@@ -130,23 +186,35 @@ AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Te
 
     AttentionPlan plan;
     plan.lq = lq;
+    plan.heads = batch_heads;
+    plan.rows = lq_padded;
+    plan.row_step = ATTENTION_COOP_ROWS;
     plan.out = at::empty({batch_heads, lq_padded, head_dim}, q.options());
-    TuneDispatch& d = plan.dispatch;
-    d.key = ShaderKey{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, q.scalar_type()};
-    d.subgroupSize = subgroup;
-    d.spec.push(static_cast<uint32_t>(ATTENTION_COOP_SUBGROUPS * subgroup)).push(subgroup);
-    d.push.push(get_tensor_address(q_padded))
-          .push(get_tensor_address(k))
-          .push(get_tensor_address(v))
-          .push(get_output_address(plan.out))
-          .push(static_cast<uint32_t>(lq_padded))
-          .push(static_cast<uint32_t>(k.size(1)))
-          .push(softmax_scale)
-          .push(static_cast<uint32_t>(0));
-    d.read = {q_padded, k, v};
-    d.write = {plan.out};
-    d.groupX = static_cast<uint32_t>(lq_padded / ATTENTION_COOP_ROWS);
-    d.groupY = static_cast<uint32_t>(batch_heads);
+    const at::Tensor out = plan.out;
+    const uint64_t elem = c10::elementSize(q.scalar_type());
+    const int64_t lk = k.size(1);
+    plan.chunk = [=](int64_t head_start, int64_t head_count, int64_t row_start, int64_t row_count) {
+        // a chunk of heads starts further into each tensor; its rows start at row_offset
+        const uint64_t q_skip = head_start * lq_padded * head_dim * elem;
+        const uint64_t kv_skip = head_start * lk * head_dim * elem;
+        TuneDispatch d;
+        d.key = ShaderKey{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, q.scalar_type()};
+        d.subgroupSize = subgroup;
+        d.spec.push(static_cast<uint32_t>(ATTENTION_COOP_SUBGROUPS * subgroup)).push(subgroup);
+        d.push.push(get_tensor_address(q_padded) + q_skip)
+              .push(get_tensor_address(k) + kv_skip)
+              .push(get_tensor_address(v) + kv_skip)
+              .push(get_output_address(out) + q_skip)
+              .push(static_cast<uint32_t>(lq_padded))
+              .push(static_cast<uint32_t>(lk))
+              .push(softmax_scale)
+              .push(static_cast<uint32_t>(row_start));
+        d.read = {q_padded, k, v};
+        d.write = {out};
+        d.groupX = static_cast<uint32_t>((row_count + ATTENTION_COOP_ROWS - 1) / ATTENTION_COOP_ROWS);
+        d.groupY = static_cast<uint32_t>(head_count);
+        return d;
+    };
     return plan;
 }
 
@@ -165,23 +233,37 @@ AttentionPlan scalar_plan(DeviceContext* device, const at::Tensor& q, const at::
 
     AttentionPlan plan;
     plan.lq = lq;
+    plan.heads = batch_heads;
+    plan.rows = lq;
+    plan.row_step = rows_per_group;
     plan.out = at::empty({batch_heads, lq, head_dim}, q.options());
-    TuneDispatch& d = plan.dispatch;
-    d.key = ShaderKey{attention_kernel_for(head_dim), q.scalar_type()};
-    d.subgroupSize = device->default_subgroup_size;
-    d.spec.push(ATTENTION_WG_SIZE);
-    d.push.push(get_tensor_address(q))
-          .push(get_tensor_address(k))
-          .push(get_tensor_address(v))
-          .push(get_output_address(plan.out))
-          .push(static_cast<uint32_t>(lq))
-          .push(static_cast<uint32_t>(k.size(1)))
-          .push(static_cast<uint32_t>(head_dim))
-          .push(softmax_scale);
-    d.read = {q, k, v};
-    d.write = {plan.out};
-    d.groupX = static_cast<uint32_t>((lq + rows_per_group - 1) / rows_per_group);
-    d.groupY = static_cast<uint32_t>(batch_heads);
+    const at::Tensor out = plan.out;
+    const uint64_t elem = c10::elementSize(q.scalar_type());
+    const int64_t lk = k.size(1);
+    const uint32_t subgroup = device->default_subgroup_size;
+    plan.chunk = [=](int64_t head_start, int64_t head_count, int64_t row_start, int64_t row_count) {
+        const uint64_t q_skip = head_start * lq * head_dim * elem;
+        const uint64_t kv_skip = head_start * lk * head_dim * elem;
+        TuneDispatch d;
+        d.key = ShaderKey{attention_kernel_for(head_dim), q.scalar_type()};
+        d.subgroupSize = subgroup;
+        d.spec.push(ATTENTION_WG_SIZE);
+        d.push.push(get_tensor_address(q) + q_skip)
+              .push(get_tensor_address(k) + kv_skip)
+              .push(get_tensor_address(v) + kv_skip)
+              .push(get_output_address(out) + q_skip)
+              .push(static_cast<uint32_t>(lq))
+              .push(static_cast<uint32_t>(lk))
+              .push(static_cast<uint32_t>(head_dim))
+              .push(softmax_scale)
+              .push(static_cast<uint32_t>(row_start))
+              .push(static_cast<uint32_t>(0));
+        d.read = {q, k, v};
+        d.write = {out};
+        d.groupX = static_cast<uint32_t>((row_count + rows_per_group - 1) / rows_per_group);
+        d.groupY = static_cast<uint32_t>(head_count);
+        return d;
+    };
     return plan;
 }
 
@@ -232,14 +314,14 @@ at::Tensor scaled_dot_product_attention_vulkan(
         const uint64_t tuned_id = bucket(lq) | (bucket(lk) << 17) | (static_cast<uint64_t>(head_dim) << 34);
         const ShaderKey key{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, query.scalar_type()};
         const TuneConfig& chosen = device->tuner->select(key, tuned_id, space, [&](const TuneConfig& cfg) {
-            return (cfg[0] == 1 ? coop_plan(device, q, k, v, softmax_scale) : scalar_plan(device, q, k, v, softmax_scale)).dispatch;
+            const AttentionPlan p = cfg[0] == 1 ? coop_plan(device, q, k, v, softmax_scale) : scalar_plan(device, q, k, v, softmax_scale);
+            return first_attention_chunk(device, p, lk, head_dim);
         });
         if (!chosen.empty()) use_coop = chosen[0] == 1;
     }
 
     AttentionPlan plan = use_coop ? coop_plan(device, q, k, v, softmax_scale) : scalar_plan(device, q, k, v, softmax_scale);
-    const TuneDispatch& d = plan.dispatch;
-    device->shader_manager->dispatchShader(d.key, d.subgroupSize, d.spec.build(), d.push.build(), d.read, d.write, d.groupX, d.groupY, d.groupZ);
+    run_attention(device, plan, lk, head_dim);
     return plan.result().view(query.sizes());
 }
 

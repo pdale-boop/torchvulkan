@@ -34,7 +34,7 @@ public struct AttentionCoopPushConstants
     public uint lq_padded;
     public uint lk;
     public float scale;
-    public uint padding;
+    public uint row_offset;  // first query row of this dispatch (large problems are split, see attention.cpp)
 }
 
 typealias Acc = linalg::CoopMat<float, MemoryScope.Subgroup, F, F, linalg::CoopMatMatrixUse.MatrixAccumulator>;
@@ -75,7 +75,7 @@ void attention_coop_main<T : ITorchVulkan & ICoopElement, let D : int>(
     uint row = lane / lanes;                           // this lane's row within the subgroup
     uint part = lane % lanes;
     uint bh = wg.y;
-    uint row0 = wg.x * ROWS + sg * F;                  // this subgroup's first query row
+    uint row0 = pcs.row_offset + wg.x * ROWS + sg * F; // this subgroup's first query row
 
     T* q = (T*)pcs.q;
     T* k = (T*)pcs.k;

@@ -13,6 +13,24 @@ DTYPES = [torch.float32, torch.float16] + ([torch.bfloat16] if torchvulkan.is_bf
 TOL = {torch.float32: 2e-4, torch.float16: 4e-3, torch.bfloat16: 3e-2}
 
 
+@pytest.mark.parametrize("dtype", DTYPES, ids=str)
+@pytest.mark.parametrize("heads,lq,lk,head_dim", [
+    (6, 200, 150, 64),    # split by heads
+    (2, 700, 600, 128),   # one head over the cap: split by query rows
+    (3, 130, 90, 512),
+])
+def test_split_dispatches_match_one_dispatch(monkeypatch, dtype, heads, lq, lk, head_dim):
+    # TORCHVULKAN_ATTENTION_CHUNK caps the work per dispatch (in units of 2^20 rows x keys x head
+    # size), as on integrated GPUs, where one long dispatch trips the GPU watchdog
+    g = torch.Generator().manual_seed(heads * lq)
+    q, k, v = (torch.randn(1, heads, n, head_dim, generator=g).to(dtype).to("vulkan") for n in (lq, lk, lk))
+    monkeypatch.setenv("TORCHVULKAN_ATTENTION_CHUNK", "1000000000")
+    whole = F.scaled_dot_product_attention(q, k, v).cpu()
+    monkeypatch.setenv("TORCHVULKAN_ATTENTION_CHUNK", "1")
+    split = F.scaled_dot_product_attention(q, k, v).cpu()
+    torch.testing.assert_close(split, whole, rtol=0, atol=0)
+
+
 def compare(q, k, v, dtype, **kwargs):
     ref = F.scaled_dot_product_attention(q, k, v, **kwargs)
     on_device = {key: val.to("vulkan") if isinstance(val, torch.Tensor) else val for key, val in kwargs.items()}

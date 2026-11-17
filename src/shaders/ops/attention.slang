@@ -26,6 +26,8 @@ public struct AttentionPushConstants
     public uint lk;
     public uint head_dim;
     public float scale;
+    public uint row_offset;  // first query row of this dispatch (large problems are split, see attention.cpp)
+    public uint padding;
 }
 
 // Sum x over the RL lanes that share a row (RL adjacent, RL-aligned subgroup lanes).
@@ -55,7 +57,7 @@ void attention_main<T : ITorchVulkan, let D : int, let BC : int, let RL : int>(
 
     uint lane = li.x;
     uint part = lane % ROW_LANES;
-    uint row = wg.x * (WG_x / ROW_LANES) + lane / ROW_LANES;
+    uint row = pcs.row_offset + wg.x * (WG_x / ROW_LANES) + lane / ROW_LANES;
     bool valid = row < pcs.lq;   // the same for all lanes of a row
     uint hd = pcs.head_dim;
 
