@@ -70,8 +70,6 @@ uint32_t attention_row_lanes(int64_t head_dim)
     return head_dim > 256 ? 8 : 4;
 }
 
-constexpr int64_t ATTENTION_COOP_SUBGROUPS = 4;  // SUBGROUPS in attention_coop.slang
-constexpr int64_t ATTENTION_COOP_ROWS = ATTENTION_COOP_SUBGROUPS * 16;  // query rows per workgroup
 constexpr int64_t ATTENTION_COOP_KEYS = 32;  // BC in attention_coop.slang
 
 bool env_flag(const char* name)
@@ -147,23 +145,33 @@ void run_attention(DeviceContext* device, const AttentionPlan& plan, int64_t lk,
 
 // The cooperative-matrix kernel: float16 or bfloat16, head sizes 64 and 128, on devices with 16x16x16
 // T x T -> float32 cooperative matrices and subgroup shuffles (the softmax combines lanes with them).
-bool coop_applies(DeviceContext* device, at::ScalarType dtype, int64_t head_dim)
+// Subgroups per workgroup for the cooperative-matrix kernel, or 0 where it doesn't apply. Each
+// subgroup owns 16 query rows. 8 subgroups share each staged K/V tile between twice as many rows
+// as 4 and were ~18% faster on an RTX 5070 Ti (24 x 4608 x 128 bf16: 24.9 -> 20.4 ms), but their
+// P/S tiles need more shared memory (exactly the 48 KB NVIDIA offers at head size 128), so devices
+// with less get 4.
+int64_t coop_subgroups(DeviceContext* device, at::ScalarType dtype, int64_t head_dim)
 {
-    if (!device->support_coopmat || !device->support_subgroup_shuffle) return false;
-    if ((dtype != at::kHalf && dtype != at::kBFloat16) || (head_dim != 64 && head_dim != 128)) return false;
+    if (!device->support_coopmat || !device->support_subgroup_shuffle) return 0;
+    if ((dtype != at::kHalf && dtype != at::kBFloat16) || (head_dim != 64 && head_dim != 128)) return 0;
 
     bool has_fragment = false;
     for (const CoopMatConfig& c : device->cache.getCoopMatConfig(dtype, dtype, at::kFloat, at::kFloat)) {
         if (c.m == 16 && c.n == 16 && c.k == 16) has_fragment = true;
     }
     const uint32_t subgroup = device->default_subgroup_size;
+    if (!has_fragment || subgroup == 0) return 0;
     const uint64_t element = c10::elementSize(dtype);
-    const uint64_t shared = 2 * ATTENTION_COOP_KEYS * head_dim * element            // K and V tiles
-                          + ATTENTION_COOP_ROWS * ATTENTION_COOP_KEYS * (element + 4) // P and S
-                          + ATTENTION_COOP_ROWS * 16 * 4;                             // row factors
-    return has_fragment && subgroup > 0 &&
-           ATTENTION_COOP_SUBGROUPS * subgroup <= device->properties.limits.maxComputeWorkGroupInvocations &&
-           shared <= device->properties.limits.maxComputeSharedMemorySize;
+    for (int64_t subgroups : {8, 4}) {
+        const uint64_t rows = subgroups * 16;
+        const uint64_t shared = 2 * ATTENTION_COOP_KEYS * head_dim * element  // K and V tiles
+                              + rows * ATTENTION_COOP_KEYS * (element + 4)    // P and S
+                              + rows * 16 * 4;                                // row factors
+        if (subgroups * subgroup <= device->properties.limits.maxComputeWorkGroupInvocations &&
+            shared <= device->properties.limits.maxComputeSharedMemorySize)
+            return subgroups;
+    }
+    return 0;
 }
 
 // q, k and v are contiguous [batch * heads, length, head_dim]
@@ -172,7 +180,9 @@ AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Te
     const int64_t batch_heads = q.size(0);
     const int64_t lq = q.size(1);
     const int64_t head_dim = q.size(2);
-    const int64_t lq_padded = (lq + ATTENTION_COOP_ROWS - 1) / ATTENTION_COOP_ROWS * ATTENTION_COOP_ROWS;
+    const int64_t subgroups = coop_subgroups(device, q.scalar_type(), head_dim);
+    const int64_t rows_per_group = subgroups * 16;
+    const int64_t lq_padded = (lq + rows_per_group - 1) / rows_per_group * rows_per_group;
     const uint32_t subgroup = device->default_subgroup_size;
 
     // whole 16-row fragments are loaded and stored, so q and the output are padded to whole
@@ -188,7 +198,7 @@ AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Te
     plan.lq = lq;
     plan.heads = batch_heads;
     plan.rows = lq_padded;
-    plan.row_step = ATTENTION_COOP_ROWS;
+    plan.row_step = rows_per_group;
     plan.out = at::empty({batch_heads, lq_padded, head_dim}, q.options());
     const at::Tensor out = plan.out;
     const uint64_t elem = c10::elementSize(q.scalar_type());
@@ -200,7 +210,7 @@ AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Te
         TuneDispatch d;
         d.key = ShaderKey{head_dim == 64 ? torchvulkan::Kernel::ATTENTION_COOP_64 : torchvulkan::Kernel::ATTENTION_COOP_128, q.scalar_type()};
         d.subgroupSize = subgroup;
-        d.spec.push(static_cast<uint32_t>(ATTENTION_COOP_SUBGROUPS * subgroup)).push(subgroup);
+        d.spec.push(static_cast<uint32_t>(subgroups * subgroup)).push(subgroup).push(static_cast<uint32_t>(subgroups));
         d.push.push(get_tensor_address(q_padded) + q_skip)
               .push(get_tensor_address(k) + kv_skip)
               .push(get_tensor_address(v) + kv_skip)
@@ -211,7 +221,7 @@ AttentionPlan coop_plan(DeviceContext* device, const at::Tensor& q, const at::Te
               .push(static_cast<uint32_t>(row_start));
         d.read = {q_padded, k, v};
         d.write = {out};
-        d.groupX = static_cast<uint32_t>((row_count + ATTENTION_COOP_ROWS - 1) / ATTENTION_COOP_ROWS);
+        d.groupX = static_cast<uint32_t>((row_count + rows_per_group - 1) / rows_per_group);
         d.groupY = static_cast<uint32_t>(head_count);
         return d;
     };
@@ -298,7 +308,7 @@ at::Tensor scaled_dot_product_attention_vulkan(
     float softmax_scale = scale.has_value() ? static_cast<float>(*scale) : 1.0f / std::sqrt(static_cast<float>(head_dim));
 
     // TORCHVULKAN_ATTENTION_SCALAR=1 or _COOP=1 forces one kernel (for comparisons)
-    bool coop = coop_applies(device, query.scalar_type(), head_dim) && !env_flag("TORCHVULKAN_ATTENTION_SCALAR");
+    bool coop = coop_subgroups(device, query.scalar_type(), head_dim) > 0 && !env_flag("TORCHVULKAN_ATTENTION_SCALAR");
     bool scalar = scalar_applies(device, head_dim) && !(coop && env_flag("TORCHVULKAN_ATTENTION_COOP"));
     if (!coop && !scalar)
         return sdpa_math(query, key, value, attn_mask, dropout_p, is_causal, scale, enable_gqa);

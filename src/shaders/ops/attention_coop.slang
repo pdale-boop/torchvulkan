@@ -18,8 +18,9 @@ __exported import core.dtype;
 
 [[vk::constant_id(0)]] public const uint WG_SIZE = 128;       // SUBGROUPS * SUBGROUP_SIZE
 [[vk::constant_id(1)]] public const uint SUBGROUP_SIZE = 32;
+// 8 where shared memory allows (each K/V tile then serves twice as many query rows), else 4
+[[vk::constant_id(2)]] public const uint SUBGROUPS = 4;
 
-static const uint SUBGROUPS = 4;
 static const uint F = 16;                  // fragment size (16 x 16 x 16)
 static const uint BC = 32;                 // keys per tile
 static const uint ROWS = SUBGROUPS * F;    // query rows per workgroup
