@@ -8,7 +8,7 @@
 #include <type_traits>
 
 #define MAX_PUSH_CONSTANT_BYTES 128
-#define MAX_SPEC_CONSTANTS 32
+#define MAX_SPEC_CONSTANTS 48
 #define MAX_SPEC_DATA_BYTES 256
 #define MAX_DIMS 64
 #define MAX_METADATA_SECTIONS 8
@@ -17,6 +17,7 @@ struct SpecializationArgs {
     const void* data = nullptr;
     const size_t* offsets = nullptr;
     const size_t* sizes = nullptr;
+    const uint32_t* ids = nullptr;
     const uint32_t numConstants = 0;
     const std::string_view key{};
 };
@@ -30,9 +31,11 @@ public:
         static_assert(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>, "specialization constants must be non-bool arithmetic types");
         TORCH_CHECK(numConstants_ < MAX_SPEC_CONSTANTS, "torchvulkan [ERROR]: Too many specialization constants!");
         TORCH_CHECK(data_size_ + sizeof(T) <= MAX_SPEC_DATA_BYTES, "torchvulkan [ERROR]: Specialization constant data exceeded buffer!");
+        TORCH_CHECK(key_size_ + 1 + sizeof(T) <= key_buffer.size(), "torchvulkan [ERROR]: Specialization constant data exceeded buffer!");
 
         offsets_array[numConstants_] = data_size_;
         sizes_array[numConstants_] = sizeof(T);
+        ids_array[numConstants_] = next_id_++;
         numConstants_++;
 
         std::memcpy(data_buffer.data() + data_size_, &value, sizeof(T));
@@ -45,20 +48,34 @@ public:
         return *this;
     }
 
+    // the next push goes to constant_id `id`: a module's constants can start past an imported library's
+    SpecializationBuilder& at(uint32_t id) {
+        TORCH_CHECK(id >= next_id_, "torchvulkan [ERROR]: specialization constant ids must increase.");
+        TORCH_CHECK(key_size_ + 5 <= key_buffer.size(), "torchvulkan [ERROR]: Specialization constant data exceeded buffer!");
+        next_id_ = id;
+        key_buffer[key_size_] = 0; // a size no constant has
+        std::memcpy(key_buffer.data() + key_size_ + 1, &id, sizeof(id));
+        key_size_ += 1 + sizeof(id);
+        return *this;
+    }
+
     const void* data() const { return data_buffer.data(); }
     const size_t* offsets() const { return offsets_array.data(); }
     const size_t* sizes() const { return sizes_array.data(); }
+    const uint32_t* ids() const { return ids_array.data(); }
     uint32_t numConstants() const { return numConstants_; }
 
     std::string_view key() const { return std::string_view(reinterpret_cast<const char*>(key_buffer.data()), key_size_); }
-    SpecializationArgs build() const { return {data(), offsets(), sizes(), numConstants(), key()}; }
+    SpecializationArgs build() const { return {data(), offsets(), sizes(), ids(), numConstants(), key()}; }
 
 private:
     std::array<uint8_t, MAX_SPEC_DATA_BYTES> data_buffer{};
     std::array<size_t, MAX_SPEC_CONSTANTS> offsets_array{};
     std::array<size_t, MAX_SPEC_CONSTANTS> sizes_array{};
+    std::array<uint32_t, MAX_SPEC_CONSTANTS> ids_array{};
     std::array<uint8_t, MAX_SPEC_CONSTANTS + MAX_SPEC_DATA_BYTES> key_buffer{};
     uint32_t numConstants_ = 0;
+    uint32_t next_id_ = 0;
     size_t data_size_ = 0;
     size_t key_size_ = 0;
 };
@@ -98,20 +115,23 @@ public:
         return *this;
     }
 
+    // 8- and 16-bit scalars are pushed widened to 32 bits, matching T.PushScalar in core/dtype.slang:
+    // storagePushConstant8/16 are optional and AMD's Windows driver for RDNA2 supports neither.
+    // Half and bfloat16 are rounded to their own type first, so the shader sees the same value.
     // floating dtypes cast as the CPU's TensorIterator casts a wrapped double: out of range is inf, not an error
     PushConstantBuilder& push_scalar(const at::Scalar& value, at::ScalarType dtype)
     {
         bool real_float = value.isFloatingPoint() || value.isIntegral(/*includeBool=*/false);
         switch (dtype) {
-            case at::kByte: push(value.to<uint8_t>()); break;
-            case at::kChar: push(value.to<int8_t>()); break;
-            case at::kShort: push(value.to<int16_t>()); break;
+            case at::kByte: push(static_cast<uint32_t>(value.to<uint8_t>())); break;
+            case at::kChar: push(static_cast<int32_t>(value.to<int8_t>())); break;
+            case at::kShort: push(static_cast<int32_t>(value.to<int16_t>())); break;
             case at::kInt: push(value.to<int32_t>()); break;
             case at::kLong: push(value.to<int64_t>()); break;
-            case at::kBool: push(value.to<bool>()); break;
-            case at::kHalf: push(real_float ? c10::Half(static_cast<float>(value.toDouble())) : value.to<c10::Half>()); break;
-            case at::kBFloat16: push(real_float ? c10::BFloat16(static_cast<float>(value.toDouble())) : value.to<c10::BFloat16>()); break;
-            case at::ScalarType::UInt16: push(value.to<uint16_t>()); break;
+            case at::kBool: push(static_cast<uint32_t>(value.to<bool>())); break;
+            case at::kHalf: push(static_cast<float>(real_float ? c10::Half(static_cast<float>(value.toDouble())) : value.to<c10::Half>())); break;
+            case at::kBFloat16: push(static_cast<float>(real_float ? c10::BFloat16(static_cast<float>(value.toDouble())) : value.to<c10::BFloat16>())); break;
+            case at::ScalarType::UInt16: push(static_cast<uint32_t>(value.to<uint16_t>())); break;
             case at::ScalarType::UInt32: push(value.to<uint32_t>()); break;
             case at::ScalarType::UInt64: push(value.to<uint64_t>()); break;
             case at::kDouble: push(value.to<double>()); break;
@@ -123,16 +143,17 @@ public:
     }
 
     // a scalar operand (a wrapped Python number) converts as a tensor element does: an integer wraps, as static_cast does
+    // (8- and 16-bit results widened to 32 bits, as in push_scalar)
     PushConstantBuilder& push_operand_scalar(const at::Scalar& value, at::ScalarType dtype)
     {
         if (!at::isIntegralType(dtype, /*includeBool=*/false) || !value.isIntegral(/*includeBool=*/false)) return push_scalar(value, dtype);
         int64_t v = value.type() == at::ScalarType::UInt64 ? static_cast<int64_t>(value.to<uint64_t>()) : value.toLong();
         switch (dtype) {
-            case at::kByte: push(static_cast<uint8_t>(v)); break;
-            case at::kChar: push(static_cast<int8_t>(v)); break;
-            case at::kShort: push(static_cast<int16_t>(v)); break;
+            case at::kByte: push(static_cast<uint32_t>(static_cast<uint8_t>(v))); break;
+            case at::kChar: push(static_cast<int32_t>(static_cast<int8_t>(v))); break;
+            case at::kShort: push(static_cast<int32_t>(static_cast<int16_t>(v))); break;
             case at::kInt: push(static_cast<int32_t>(v)); break;
-            case at::ScalarType::UInt16: push(static_cast<uint16_t>(v)); break;
+            case at::ScalarType::UInt16: push(static_cast<uint32_t>(static_cast<uint16_t>(v))); break;
             case at::ScalarType::UInt32: push(static_cast<uint32_t>(v)); break;
             case at::ScalarType::UInt64: push(static_cast<uint64_t>(v)); break;
             default: push(v); break;
