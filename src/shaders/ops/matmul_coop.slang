@@ -145,6 +145,59 @@ void loadTile<T : ITorchVulkan & ICoopElement, let VEC : int>(
     }
 }
 
+// Whether every tile of this workgroup can take loadTileFast once its K range is in bounds. Uniform per workgroup.
+bool tileLoadsInBounds<A : ITorchVulkan>(CoopTile tile, CoopPushConstants<A> pcs)
+{
+    return A_VEC_ALIGNED == 1 && B_VEC_ALIGNED == 1
+        && (A_TRANSPOSED == 0 || M_ALIGNED == 1 || tile.tile_m + SMEM_ROWS_A <= pcs.m_dim)
+        && (B_TRANSPOSED == 1 || N_ALIGNED == 1 || tile.tile_n + SMEM_COLS_B <= pcs.n_dim);
+}
+
+// loadTile for a tile entirely in bounds (k + BK <= k_dim and tileLoadsInBounds): no per-load bounds checks, so the
+// prefetch loads sit in straight-line code and their latency overlaps the MMAs of the current tile.
+void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
+    uint ti, CoopTile tile, CoopPushConstants<T.Accum> pcs, uint k, inout vector<T, VEC> regA[LOADS_A], inout vector<T, VEC> regB[LOADS_B])
+{
+    T* tensor_a = (T*)pcs.tensor_a;
+    T* tensor_b = (T*)pcs.tensor_b;
+    [unroll] for (uint j = 0; j < LOADS_A; ++j)
+    {
+        uint i = ti + j * WORKGROUP_SIZE;
+        if (i >= SMEM_ROWS_A * BK / VEC) continue;
+        if (A_TRANSPOSED == 1)
+        {
+            uint kk = k + i / (SMEM_ROWS_A / VEC);
+            uint m = tile.tile_m + (i % (SMEM_ROWS_A / VEC)) * VEC;
+            regA[j] = loadContiguous<T, VEC>(tensor_a, tile.batch_offset_a + kk * pcs.strides_a.col + m);
+        }
+        else
+        {
+            uint m = tile.tile_m + i / (BK / VEC);
+            if (M_ALIGNED == 0) m = min(m, pcs.m_dim - 1);
+            uint kk = k + (i % (BK / VEC)) * VEC;
+            regA[j] = loadContiguous<T, VEC>(tensor_a, tile.batch_offset_a + m * pcs.strides_a.row + kk);
+        }
+    }
+    [unroll] for (uint j = 0; j < LOADS_B; ++j)
+    {
+        uint i = ti + j * WORKGROUP_SIZE;
+        if (i >= BK * SMEM_COLS_B / VEC) continue;
+        if (B_TRANSPOSED == 1)
+        {
+            uint n = tile.tile_n + i / (BK / VEC);
+            if (N_ALIGNED == 0) n = min(n, pcs.n_dim - 1);
+            uint kk = k + (i % (BK / VEC)) * VEC;
+            regB[j] = loadContiguous<T, VEC>(tensor_b, tile.batch_offset_b + n * pcs.strides_b.col + kk);
+        }
+        else
+        {
+            uint kk = k + i / (SMEM_COLS_B / VEC);
+            uint n = tile.tile_n + (i % (SMEM_COLS_B / VEC)) * VEC;
+            regB[j] = loadContiguous<T, VEC>(tensor_b, tile.batch_offset_b + kk * pcs.strides_b.row + n);
+        }
+    }
+}
+
 void storeTile<T : ITorchVulkan & ICoopElement, let VEC : int>(
     uint ti, uint stage, vector<T, VEC> regA[LOADS_A], vector<T, VEC> regB[LOADS_B])
 {
@@ -179,6 +232,7 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, let VEC : int>(
     vector<T, VEC> regB[LOADS_B];
 
     uint stage = 0;
+    bool fast = tileLoadsInBounds(tile, pcs);
     if (pcs.k_dim > 0)
     {
         loadTile<T, VEC>(ti, tile, pcs, 0, regA, regB);
@@ -189,7 +243,11 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, let VEC : int>(
     for (uint k = 0; k < pcs.k_dim; k += BK)
     {
         bool has_next = k + BK < pcs.k_dim;
-        if (has_next) loadTile<T, VEC>(ti, tile, pcs, k + BK, regA, regB);
+        if (has_next)
+        {
+            if (fast && k + 2 * BK <= pcs.k_dim) loadTileFast<T, VEC>(ti, tile, pcs, k + BK, regA, regB);
+            else loadTile<T, VEC>(ti, tile, pcs, k + BK, regA, regB);
+        }
 
         uint base_a = stage * stageA();
         uint base_b = stage * stageB();
