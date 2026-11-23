@@ -67,6 +67,15 @@ vector<T, VEC> loadContiguous<T : ITorchVulkan, let VEC : int>(T* tensor, uint i
     return v;
 }
 
+// loadTileFast's loads: one aligned vector load (idx is a multiple of VEC there, as A/B_VEC_ALIGNED guarantee). Read
+// as 32-bit words and bit-cast: a loadAligned of a 16-bit vector type gives NaN on AMD's RDNA2 driver.
+vector<T, VEC> loadFastVector<T : ITorchVulkan, let VEC : int>(T* tensor, uint idx)
+{
+    if (VEC * sizeof(T) == 16) return bit_cast<vector<T, VEC>>(((uint4*)tensor)[idx / VEC]);
+    if (VEC * sizeof(T) == 8) return bit_cast<vector<T, VEC>>(((uint2*)tensor)[idx / VEC]);
+    return loadContiguous<T, VEC>(tensor, idx);
+}
+
 vector<T, VEC> loadVectorA<T : ITorchVulkan & ICoopElement, let VEC : int>(CoopTile tile, CoopPushConstants<T.Accum> pcs, uint i, uint k, bool full)
 {
     T* tensor_a = (T*)pcs.tensor_a;
@@ -168,14 +177,14 @@ void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
         {
             uint kk = k + i / (SMEM_ROWS_A / VEC);
             uint m = tile.tile_m + (i % (SMEM_ROWS_A / VEC)) * VEC;
-            regA[j] = loadContiguous<T, VEC>(tensor_a, tile.batch_offset_a + kk * pcs.strides_a.col + m);
+            regA[j] = loadFastVector<T, VEC>(tensor_a, tile.batch_offset_a + kk * pcs.strides_a.col + m);
         }
         else
         {
             uint m = tile.tile_m + i / (BK / VEC);
             if (M_ALIGNED == 0) m = min(m, pcs.m_dim - 1);
             uint kk = k + (i % (BK / VEC)) * VEC;
-            regA[j] = loadContiguous<T, VEC>(tensor_a, tile.batch_offset_a + m * pcs.strides_a.row + kk);
+            regA[j] = loadFastVector<T, VEC>(tensor_a, tile.batch_offset_a + m * pcs.strides_a.row + kk);
         }
     }
     [unroll] for (uint j = 0; j < LOADS_B; ++j)
@@ -187,13 +196,13 @@ void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
             uint n = tile.tile_n + i / (BK / VEC);
             if (N_ALIGNED == 0) n = min(n, pcs.n_dim - 1);
             uint kk = k + (i % (BK / VEC)) * VEC;
-            regB[j] = loadContiguous<T, VEC>(tensor_b, tile.batch_offset_b + n * pcs.strides_b.col + kk);
+            regB[j] = loadFastVector<T, VEC>(tensor_b, tile.batch_offset_b + n * pcs.strides_b.col + kk);
         }
         else
         {
             uint kk = k + i / (SMEM_COLS_B / VEC);
             uint n = tile.tile_n + (i % (SMEM_COLS_B / VEC)) * VEC;
-            regB[j] = loadContiguous<T, VEC>(tensor_b, tile.batch_offset_b + kk * pcs.strides_b.row + n);
+            regB[j] = loadFastVector<T, VEC>(tensor_b, tile.batch_offset_b + kk * pcs.strides_b.row + n);
         }
     }
 }
