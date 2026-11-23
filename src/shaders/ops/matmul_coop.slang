@@ -67,49 +67,15 @@ vector<T, VEC> loadContiguous<T : ITorchVulkan, let VEC : int>(T* tensor, uint i
     return v;
 }
 
-// Experiment: FAST_LOAD bits. 1 = wide loads for A, 2 = wide loads for B, 4 = verify (load both ways, use the element
-// values, and return 1000.0 halves where the wide load differs), 8 = wide as 32-bit words one at a time, 16 = word
-// pointer converted from the raw 64-bit address instead of cast from T*, 32 = byte offset added to the raw address and
-// converted to a word pointer per load, 64 = index the cast word pointer in units of T (stride test).
-[[vk::constant_id(21)]] const uint FAST_LOAD = 3;
-
-vector<uint, N> loadWords<let N : int>(uint* tensor, uint word)
+// loadTileFast's loads: VEC elements at idx (a multiple of VEC, as A/B_VEC_ALIGNED guarantee) as one vector of 32-bit
+// words. The word pointer is converted straight from the tensor's address, not cast from a T*: AMD's Windows shader
+// compiler mishandles an OpBitcast from a pointer to a 16-bit type to a pointer to a wider one (it crashes on a small
+// shader and reads wrong data in this one), which is what loadAligned on a vector of T compiles to.
+vector<T, VEC> loadFastVector<T : ITorchVulkan, let VEC : int>(uint64_t address, uint idx)
 {
-    vector<uint, N> w;
-    if ((FAST_LOAD & 8) != 0)
-    {
-        [unroll] for (uint e = 0; e < N; ++e) w[e] = tensor[word + e];
-        return w;
-    }
-    if (N == 4) return bit_cast<vector<uint, N>>(((uint4*)tensor)[word / 4]);
-    return bit_cast<vector<uint, N>>(((uint2*)tensor)[word / 2]);
-}
-
-// loadTileFast's loads: one aligned vector load (idx is a multiple of VEC there, as A/B_VEC_ALIGNED guarantee), read
-// as 32-bit words and bit-cast. operand: 1 = A, 2 = B.
-vector<T, VEC> loadFastVector<T : ITorchVulkan, let VEC : int>(T* tensor, uint64_t address, uint idx, uint operand)
-{
-    if ((FAST_LOAD & operand) == 0 || (VEC * sizeof(T) != 16 && VEC * sizeof(T) != 8)) return loadContiguous<T, VEC>(tensor, idx);
-    const uint words = VEC * sizeof(T) / 4;
-    uint* word_ptr = (uint*)tensor;
-    uint word = idx * sizeof(T) / 4;
-    if ((FAST_LOAD & 16) != 0) word_ptr = (uint*)address;
-    if ((FAST_LOAD & 64) != 0) word = idx; // index the cast word pointer as if it kept T's stride
-    if ((FAST_LOAD & 32) != 0)
-    {
-        word_ptr = (uint*)(address + uint64_t(idx) * sizeof(T));
-        word = 0;
-    }
-    vector<uint, VEC * sizeof(T) / 4> w = loadWords<VEC * sizeof(T) / 4>(word_ptr, word);
-    if ((FAST_LOAD & 4) == 0) return bit_cast<vector<T, VEC>>(w);
-    vector<T, VEC> e = loadContiguous<T, VEC>(tensor, idx);
-    vector<uint, VEC * sizeof(T) / 4> ew = bit_cast<vector<uint, VEC * sizeof(T) / 4>>(e);
-    bool same = true;
-    [unroll] for (uint i = 0; i < words; ++i) same = same && ew[i] == w[i];
-    if (same) return e;
-    vector<uint, VEC * sizeof(T) / 4> poison;
-    [unroll] for (uint i = 0; i < words; ++i) poison[i] = 0x63D063D0u;
-    return bit_cast<vector<T, VEC>>(poison);
+    if (VEC * sizeof(T) == 16) return bit_cast<vector<T, VEC>>(((uint4*)address)[idx / VEC]);
+    if (VEC * sizeof(T) == 8) return bit_cast<vector<T, VEC>>(((uint2*)address)[idx / VEC]);
+    return loadContiguous<T, VEC>((T*)address, idx);
 }
 
 vector<T, VEC> loadVectorA<T : ITorchVulkan & ICoopElement, let VEC : int>(CoopTile tile, CoopPushConstants<T.Accum> pcs, uint i, uint k, bool full)
@@ -203,8 +169,6 @@ bool tileLoadsInBounds<A : ITorchVulkan>(CoopTile tile, CoopPushConstants<A> pcs
 void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
     uint ti, CoopTile tile, CoopPushConstants<T.Accum> pcs, uint k, inout vector<T, VEC> regA[LOADS_A], inout vector<T, VEC> regB[LOADS_B])
 {
-    T* tensor_a = (T*)pcs.tensor_a;
-    T* tensor_b = (T*)pcs.tensor_b;
     [unroll] for (uint j = 0; j < LOADS_A; ++j)
     {
         uint i = ti + j * WORKGROUP_SIZE;
@@ -213,14 +177,14 @@ void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
         {
             uint kk = k + i / (SMEM_ROWS_A / VEC);
             uint m = tile.tile_m + (i % (SMEM_ROWS_A / VEC)) * VEC;
-            regA[j] = loadFastVector<T, VEC>(tensor_a, pcs.tensor_a, tile.batch_offset_a + kk * pcs.strides_a.col + m, 1);
+            regA[j] = loadFastVector<T, VEC>(pcs.tensor_a, tile.batch_offset_a + kk * pcs.strides_a.col + m);
         }
         else
         {
             uint m = tile.tile_m + i / (BK / VEC);
             if (M_ALIGNED == 0) m = min(m, pcs.m_dim - 1);
             uint kk = k + (i % (BK / VEC)) * VEC;
-            regA[j] = loadFastVector<T, VEC>(tensor_a, pcs.tensor_a, tile.batch_offset_a + m * pcs.strides_a.row + kk, 1);
+            regA[j] = loadFastVector<T, VEC>(pcs.tensor_a, tile.batch_offset_a + m * pcs.strides_a.row + kk);
         }
     }
     [unroll] for (uint j = 0; j < LOADS_B; ++j)
@@ -232,13 +196,13 @@ void loadTileFast<T : ITorchVulkan & ICoopElement, let VEC : int>(
             uint n = tile.tile_n + i / (BK / VEC);
             if (N_ALIGNED == 0) n = min(n, pcs.n_dim - 1);
             uint kk = k + (i % (BK / VEC)) * VEC;
-            regB[j] = loadFastVector<T, VEC>(tensor_b, pcs.tensor_b, tile.batch_offset_b + n * pcs.strides_b.col + kk, 2);
+            regB[j] = loadFastVector<T, VEC>(pcs.tensor_b, tile.batch_offset_b + n * pcs.strides_b.col + kk);
         }
         else
         {
             uint kk = k + i / (SMEM_COLS_B / VEC);
             uint n = tile.tile_n + (i % (SMEM_COLS_B / VEC)) * VEC;
-            regB[j] = loadFastVector<T, VEC>(tensor_b, pcs.tensor_b, tile.batch_offset_b + kk * pcs.strides_b.row + n, 2);
+            regB[j] = loadFastVector<T, VEC>(pcs.tensor_b, tile.batch_offset_b + kk * pcs.strides_b.row + n);
         }
     }
 }
