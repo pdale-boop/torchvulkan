@@ -10,6 +10,17 @@
 
 namespace {
 
+// Experiment: TV_FAST_LOAD picks matmul_coop.slang's FAST_LOAD bits (see there). Default 3 = wide loads for A and B.
+// The tuning file doesn't know about it, so force the config per run.
+uint32_t fast_load_mode()
+{
+    static const uint32_t mode = [] {
+        const char* s = std::getenv("TV_FAST_LOAD");
+        return s ? static_cast<uint32_t>(std::atoi(s)) : 3u;
+    }();
+    return mode;
+}
+
 enum class MatmulActivation : uint32_t
 {
     NONE = 0,
@@ -466,7 +477,8 @@ at::Tensor dispatch_matmul_coop_shader(
              .push(b_vec_aligned)
              .push(t.block)
              .push(t.shared)
-             .push(static_cast<uint32_t>(ceil_div(t.bk * tile_n / vecSize, threads))); // LOADS_B
+             .push(static_cast<uint32_t>(ceil_div(t.bk * tile_n / vecSize, threads))) // LOADS_B
+             .push(fast_load_mode());
 
         d.pcs.push(get_batch_address(ops.self_b, b0))
              .push(get_batch_address(ops.other_b, b0))
