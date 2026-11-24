@@ -204,6 +204,9 @@ KERNELS = [
     Kernel('matmul_simd', 'ops/matmul_simd.slang', [
         Entry('matmul_simd_main', DTYPES, ('vec',)),
     ]),
+    Kernel('softmax', 'ops/softmax.slang', [
+        Entry('softmax_main', [F32, F16, BF16]),  # float64 keeps the decomposition (its exp is the same either way)
+    ]),
     Kernel('conv_simd', 'ops/conv_simd.slang', [
         Entry('conv_simd_main', FLOATS, ('vec',)),
     ]),
