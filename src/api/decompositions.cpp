@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <optional>
 #include <ATen/native/Resize.h>
 #include <ATen/native/TypeProperties.h>
 #include <ATen/MemoryOverlap.h>
@@ -503,8 +504,42 @@ at::Tensor isnan_vulkan(const at::Tensor& self)
     return at::ne(self, self);
 }
 
+// softmax / log_softmax in one kernel (softmax_main): a workgroup per row of the softmax dimension, moved last and made
+// contiguous; float32 math for half and bfloat16, rounded once (or kept as float32 for half_to_float)
+std::optional<at::Tensor> softmax_kernel(const at::Tensor& self, int64_t dim, bool half_to_float, bool log)
+{
+    const at::ScalarType dtype = self.scalar_type();
+    if ((dtype != at::kFloat && !is_low_prec(dtype)) || !is_dtype_supported(self, dtype) || self.numel() == 0) return std::nullopt;
+    dim = c10::maybe_wrap_dim(dim, self.dim());
+    const bool last = self.dim() == 0 || dim == self.dim() - 1;
+    at::Tensor input = (last ? self : self.movedim(dim, -1)).contiguous();
+    const int64_t length = self.dim() == 0 ? 1 : input.size(-1);
+    const int64_t rows = input.numel() / length;
+    if (input.numel() > std::numeric_limits<int32_t>::max() || rows > std::numeric_limits<uint32_t>::max()) return std::nullopt;
+    const bool out_accum = half_to_float && is_low_prec(dtype);
+    at::Tensor out = at::empty(input.sizes(), input.options().dtype(out_accum ? at::kFloat : dtype));
+
+    DeviceContext* device = get_device_context(self);
+    const uint32_t workgroup = length >= 1024 ? 256 : length >= 256 ? 128 : 64;
+    SpecializationBuilder spd{};
+    spd.push(workgroup).push(uint32_t(log)).push(uint32_t(out_accum));
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(input)).push(get_output_address(out)).push(uint32_t(rows)).push(uint32_t(length));
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::SOFTMAX, dtype},
+        device->default_subgroup_size,
+        spd.build(),
+        pcs.build(),
+        /* read = */ {input},
+        /* write = */ {out},
+        static_cast<uint32_t>(rows), 1, 1
+    );
+    return last ? out : out.movedim(-1, dim).contiguous();
+}
+
 at::Tensor log_softmax_vulkan(const at::Tensor& self, int64_t dim, bool half_to_float)
 {
+    if (auto out = softmax_kernel(self, dim, half_to_float, true)) return *out;
     // contiguous, as the CPU's output is whatever the input's strides; half and bfloat16 accumulate in float32 and round
     // once, as CUDA's (so the result equals log_softmax(x, dtype=float32).to(half))
     bool low = is_low_prec(self.scalar_type());
@@ -545,6 +580,7 @@ at::Tensor log_softmax_backward_vulkan(
 
 at::Tensor softmax_vulkan(const at::Tensor& self, int64_t dim, bool half_to_float)
 {
+    if (auto out = softmax_kernel(self, dim, half_to_float, false)) return *out;
     bool low = is_low_prec(self.scalar_type());
     at::Tensor input = (low ? self.to(at::kFloat) : self).contiguous();
     if (input.numel() == 0) return (low && !half_to_float) ? input.to(self.scalar_type()) : input.clone();
