@@ -126,6 +126,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         info["has_bf16"] = device->support_bfloat16;
         info["has_int16"] = device->support_int16;
         info["has_int8"] = device->support_int8;
+        info["has_fp8_matmul"] = device->support_float8_coopmat; // torch._scaled_mm on float8 cooperative matrices
         return info;
     });
 

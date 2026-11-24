@@ -83,7 +83,7 @@ class Kernel:
     name: str
     module: str # path relative to src/shaders
     entries: list
-    coop_dims: tuple = None # (spec constant id, placeholder) that scripts/splice_coop_dims.py swaps into CoopMat dimensions
+    coop_dims: tuple = None # (spec constant id, placeholder) pairs that scripts/splice_coop_dims.py swaps into CoopMat dimensions
 
 
 KERNELS = [
@@ -162,6 +162,9 @@ KERNELS = [
     Kernel('resample', 'ops/resample.slang', [
         Entry('resample_main', [F64, F32]),
     ]),
+    Kernel('int_mm', 'ops/int_mm.slang', [
+        Entry('int_mm_main', [I8]),
+    ]),
     Kernel('resample_u8', 'ops/resample_u8.slang', [
         Entry('resample_u8_main', [U8]),
     ]),
@@ -213,6 +216,9 @@ KERNELS = [
     Kernel('softmax', 'ops/softmax.slang', [
         Entry('softmax_main', [F32, F16, BF16]),  # float64 keeps the decomposition (its exp is the same either way)
     ]),
+    Kernel('float8_encode', 'ops/float8.slang', [
+        Entry('float8_encode_main', [U16, U32]),
+    ]),
     Kernel('conv_simd', 'ops/conv_simd.slang', [
         Entry('conv_simd_main', FLOATS, ('vec',)),
     ]),
@@ -224,7 +230,13 @@ KERNELS = [
     ]),
     Kernel('matmul_coop', 'ops/matmul_coop.slang', [
         Entry('matmul_coop_main', DTYPES, ('vec',)),
-    ], coop_dims=(18, 1009)), # BLOCK_SIZE, COOP_DIM in helpers/gemm_coop.slang
+    ], coop_dims=(18, 1009, 22, 1013)), # BLOCK_SIZE, COOP_DIM in helpers/gemm_coop.slang; BLOCK_K, COOP_DIM_K in matmul_coop
+    Kernel('int_mm_coop', 'ops/matmul_coop.slang', [
+        Entry('int_mm_coop_main', [I8], ('vec',)),
+    ], coop_dims=(18, 1009, 22, 1013)),
+    Kernel('scaled_mm_coop', 'ops/matmul_coop.slang', [
+        Entry('scaled_mm_coop_main', [F16, BF16, F32]),
+    ], coop_dims=(18, 1009, 22, 1013)),
     Kernel('conv_coop', 'ops/conv_coop.slang', [
         Entry('conv_coop_main', FLOATS, ('vec',)),
     ], coop_dims=(18, 1009)),

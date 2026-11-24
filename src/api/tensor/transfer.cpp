@@ -272,9 +272,46 @@ bool decode_float8_vulkan(const at::Tensor& src, const at::Tensor& dst)
     return true;
 }
 
+// float32, float16 or bfloat16 -> float8_e4m3fn in one pass (float8_encode_main), with c10's rounding and saturation.
+// Returns false for other dtypes.
+bool encode_float8_vulkan(const at::Tensor& src, const at::Tensor& dst)
+{
+    const at::ScalarType in = src.scalar_type();
+    if (dst.scalar_type() != at::kFloat8_e4m3fn || (in != at::kFloat && in != at::kHalf && in != at::kBFloat16)) return false;
+    const at::ScalarType bits_type = in == at::kFloat ? at::kUInt32 : at::kUInt16;
+    DeviceContext* device = get_device_context(dst);
+    if (!is_dtype_supported(device, bits_type) || !is_dtype_supported(device, at::kByte)) return false;
+
+    at::Tensor values = src.contiguous();
+    const bool direct = dst.is_contiguous();
+    at::Tensor result = direct ? dst : at::empty(dst.sizes(), dst.options());
+    const uint64_t numel = static_cast<uint64_t>(values.numel());
+    if (numel == 0) return true;
+
+    const uint64_t src_address = get_tensor_address(values);
+    const uint64_t dst_address = get_output_address(result);
+    const uint32_t workgroup = 256;
+    SpecializationBuilder spd{};
+    spd.push(workgroup).push(uint32_t(src_address % 16 == 0 && dst_address % 16 == 0)).push(uint32_t(in == at::kBFloat16));
+    PushConstantBuilder pcs{};
+    pcs.push(src_address).push(dst_address).push(uint64_t(0)).push(numel);
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::FLOAT8_ENCODE, bits_type},
+        device->default_subgroup_size,
+        spd.build(),
+        pcs.build(),
+        /* read = */ {values},
+        /* write = */ {result},
+        get_group_count((numel + 15) / 16, workgroup), 1, 1
+    );
+    if (!direct) dst.copy_(result);
+    return true;
+}
+
 // a copy to, from or between float8 dtypes, through float32 (which holds every float8 value exactly)
 void copy_float8_vulkan_to_vulkan(const at::Tensor& src, const at::Tensor& dst)
 {
+    if (!c10::isFloat8Type(src.scalar_type()) && encode_float8_vulkan(src, dst)) return;
     if (c10::isFloat8Type(src.scalar_type()) && !c10::isFloat8Type(dst.scalar_type()) && decode_float8_vulkan(src, dst)) return;
     at::Tensor value = c10::isFloat8Type(src.scalar_type()) ? float8_to_float(src) : src;
     if (c10::isFloat8Type(dst.scalar_type())) {

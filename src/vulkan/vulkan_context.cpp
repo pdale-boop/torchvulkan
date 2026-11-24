@@ -75,6 +75,8 @@ static c10::ScalarType coop_component_to_scalar(VkComponentTypeKHR type)
         case VK_COMPONENT_TYPE_FLOAT32_KHR: return at::ScalarType::Float;
         case VK_COMPONENT_TYPE_FLOAT64_KHR: return at::ScalarType::Double;
         case COMPONENT_TYPE_BFLOAT16:       return at::ScalarType::BFloat16;
+        case VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT: return at::ScalarType::Float8_e4m3fn;
+        case VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT: return at::ScalarType::Float8_e5m2;
         case VK_COMPONENT_TYPE_SINT8_KHR:   return at::ScalarType::Char;
         case VK_COMPONENT_TYPE_SINT16_KHR:  return at::ScalarType::Short;
         case VK_COMPONENT_TYPE_SINT32_KHR:  return at::ScalarType::Int;
@@ -416,6 +418,8 @@ void VulkanContext::createDeviceWithExtensions()
         if (hasExt(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME)) chainQuery(supportedBfloat16);
         VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE supportedMixedDot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
         if (hasExt(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME)) chainQuery(supportedMixedDot);
+        VkPhysicalDeviceShaderFloat8FeaturesEXT supportedFloat8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
+        if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) chainQuery(supportedFloat8);
 
         // query which ones are supported
         vkGetPhysicalDeviceFeatures2(device->physicalDevice, &supportedFeatures2);
@@ -469,6 +473,7 @@ void VulkanContext::createDeviceWithExtensions()
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR enableCoopMatrices{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enablePipelineExec{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
         VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE enableMixedDot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+        VkPhysicalDeviceShaderFloat8FeaturesEXT enableFloat8{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT};
 
         if (supportedBfloat16.shaderBFloat16Type && enable11.storageBuffer16BitAccess)
         {
@@ -483,6 +488,18 @@ void VulkanContext::createDeviceWithExtensions()
             enableBfloat16.pNext = enable12.pNext;
             enable12.pNext = &enableBfloat16;
             deviceExtensions.push_back(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+        }
+
+        // float8 cooperative matrices (torch._scaled_mm): float8 values themselves are only ever moved as bytes elsewhere
+        if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && supportedFloat8.shaderFloat8 && supportedFloat8.shaderFloat8CooperativeMatrix &&
+            hasExt(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && supportedCoopMat.cooperativeMatrix)
+        {
+            device->support_float8_coopmat = true;
+            enableFloat8.shaderFloat8 = VK_TRUE;
+            enableFloat8.shaderFloat8CooperativeMatrix = VK_TRUE;
+            enableFloat8.pNext = enable12.pNext;
+            enable12.pNext = &enableFloat8;
+            deviceExtensions.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
         }
 
         if (hasExt(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) && supportedCoopMat.cooperativeMatrix)
@@ -506,6 +523,8 @@ void VulkanContext::createDeviceWithExtensions()
                 bool uses_bfloat16 = property.AType == COMPONENT_TYPE_BFLOAT16 || property.BType == COMPONENT_TYPE_BFLOAT16 ||
                                      property.CType == COMPONENT_TYPE_BFLOAT16 || property.ResultType == COMPONENT_TYPE_BFLOAT16;
                 if (uses_bfloat16 && !device->support_bfloat16_coopmat) continue;
+                bool uses_float8 = c10::isFloat8Type(coop_component_to_scalar(property.AType)) || c10::isFloat8Type(coop_component_to_scalar(property.BType));
+                if (uses_float8 && !device->support_float8_coopmat) continue;
 
                 device->coopmat_shapes.push_back({
                     coop_component_to_scalar(property.AType), coop_component_to_scalar(property.BType),
