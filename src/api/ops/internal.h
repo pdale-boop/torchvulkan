@@ -7,6 +7,12 @@
 
 namespace torchvulkan {
 
+// ops/softmax.cpp: softmax or log_softmax over the last dimension of contiguous float32 / float16 / bfloat16 rows, in
+// one kernel; out is the input's dtype, or float32 for half_to_float. lse, when defined, gets each row's logsumexp
+// (float32, one per row).
+bool softmax_rows_supported(const at::Tensor& input);
+void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, const at::Tensor& lse = at::Tensor());
+
 // ops/binary.cpp
 at::Tensor add_vulkan(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha);
 at::Tensor multiply_vulkan(const at::Tensor& self, const at::Tensor& other);

@@ -11,11 +11,14 @@ import core.indexing;
 [[vk::constant_id(1)]] const uint LOG = 0;
 // half or bfloat16 in, float32 out (half_to_float)
 [[vk::constant_id(2)]] const uint OUT_ACCUM = 0;
+// also write each row's logsumexp (max + log of the sum), as float32, to lse[row]
+[[vk::constant_id(3)]] const uint WRITE_LSE = 0;
 
 struct SoftmaxPushConstants
 {
     uint64_t input;
     uint64_t output;
+    uint64_t lse;
     uint rows;
     uint length;
 }
@@ -88,6 +91,8 @@ void softmax_main<T : ITorchVulkan>(
     m = smem_max[0];
     s = smem_sum[0];
     A log_s = A.ext_log(s);
+    // T.Accum is float32 for every dtype this kernel is built for
+    if (WRITE_LSE == 1 && lane == 0) ((A*)pcs.lse)[row] = A.ext_add(m, log_s);
 
     for (uint i = lane; i < pcs.length; i += WG_x)
     {
