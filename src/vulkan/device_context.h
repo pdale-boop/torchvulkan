@@ -76,6 +76,7 @@ struct DeviceContext {
 
     size_t memoryBudget();
     size_t memoryUsage();
+    size_t heapBlockBytes();
     size_t memoryTotal();
     size_t memoryFree();
     
