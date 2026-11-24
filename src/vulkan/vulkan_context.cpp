@@ -414,6 +414,8 @@ void VulkanContext::createDeviceWithExtensions()
         if (hasExt(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) chainQuery(supportedCoopMat);
         VkPhysicalDeviceShaderBfloat16FeaturesKHR supportedBfloat16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
         if (hasExt(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME)) chainQuery(supportedBfloat16);
+        VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE supportedMixedDot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+        if (hasExt(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME)) chainQuery(supportedMixedDot);
 
         // query which ones are supported
         vkGetPhysicalDeviceFeatures2(device->physicalDevice, &supportedFeatures2);
@@ -466,6 +468,7 @@ void VulkanContext::createDeviceWithExtensions()
         VkPhysicalDeviceShaderBfloat16FeaturesKHR enableBfloat16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR};
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR enableCoopMatrices{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR enablePipelineExec{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+        VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE enableMixedDot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
 
         if (supportedBfloat16.shaderBFloat16Type && enable11.storageBuffer16BitAccess)
         {
@@ -510,6 +513,16 @@ void VulkanContext::createDeviceWithExtensions()
                     property.MSize, property.NSize, property.KSize
                 });
             }
+        }
+
+        // float16 matmuls without cooperative matrices use it (matmul_dot2_main); RDNA2 runs it as v_dot2_f32_f16
+        if (hasExt(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME) && supportedMixedDot.shaderMixedFloatDotProductFloat16AccFloat32 && device->support_float16)
+        {
+            device->support_dot2_f16_f32 = true;
+            enableMixedDot.shaderMixedFloatDotProductFloat16AccFloat32 = VK_TRUE;
+            enableMixedDot.pNext = enable12.pNext;
+            enable12.pNext = &enableMixedDot;
+            deviceExtensions.push_back(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME);
         }
 
         if (hasExt(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) && supportedPipelineExec.pipelineExecutableInfo)

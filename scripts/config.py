@@ -204,6 +204,9 @@ KERNELS = [
     Kernel('matmul_simd', 'ops/matmul_simd.slang', [
         Entry('matmul_simd_main', DTYPES, ('vec',)),
     ]),
+    Kernel('matmul_dot2', 'ops/matmul_simd.slang', [
+        Entry('matmul_dot2_main', [F16]),
+    ]),
     Kernel('conv_simd', 'ops/conv_simd.slang', [
         Entry('conv_simd_main', FLOATS, ('vec',)),
     ]),

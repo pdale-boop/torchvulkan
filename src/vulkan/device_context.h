@@ -50,6 +50,7 @@ struct DeviceContext {
     bool support_int8 = false;
 
     bool support_coopmat = false;
+    bool support_dot2_f16_f32 = false; // VK_VALVE_shader_mixed_float_dot_product: float16 pair dot products into float32
     std::vector<CoopMatShape> coopmat_shapes;
     bool support_bfloat16_coopmat = false;
     bool support_subgroup_control = false;

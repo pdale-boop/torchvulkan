@@ -156,6 +156,9 @@ bool fits_matmul_indexing(const MatmulOperands& ops, const at::Tensor& out)
 const uint32_t MATMUL_TILE_N = 128;
 const uint32_t MATMUL_TILE_K = 16;
 const uint32_t MATMUL_WG = 16;
+// matmul_dot2_main: 8 threads along N (16 columns each) by 16 along M
+const uint32_t MATMUL_DOT2_WG_X = 8;
+const uint32_t MATMUL_DOT2_WG_Y = 16;
 
 void strides_of(const at::Tensor& t, uint32_t (&strides)[4])
 {
@@ -180,6 +183,16 @@ bool matmul_simd_fits(DeviceContext* device, c10::ScalarType compute_type, uint3
     if (MATMUL_WG * MATMUL_WG > limits.maxComputeWorkGroupInvocations || shared_bytes > limits.maxComputeSharedMemorySize) return false;
     if (ceil_div(max_m, tile_m) > limits.maxComputeWorkGroupCount[1] || ceil_div(max_n, MATMUL_TILE_N) > limits.maxComputeWorkGroupCount[0]) return false;
     return !device->support_subgroup_control || MATMUL_WG * MATMUL_WG <= subgroup * device->max_workgroup_subgroups;
+}
+
+// float16 matmuls run on packed dot products where the driver exposes them; TORCHVULKAN_DOT2=0 turns that off
+bool use_matmul_dot2(DeviceContext* device, c10::ScalarType dtype)
+{
+    static const bool disabled = [] {
+        const char* env = std::getenv("TORCHVULKAN_DOT2");
+        return env != nullptr && std::string(env) == "0";
+    }();
+    return dtype == at::kHalf && device->support_dot2_f16_f32 && !disabled;
 }
 
 // the cooperative-matrix tuner times this too: emulated cooperative matrices can lose to it by far
@@ -214,14 +227,37 @@ TuneDispatch matmul_simd_dispatch(
     if (has_bias) strides_of(ops.bias_b, strides_bias);
 
     TuneDispatch d;
-    d.key = ShaderKey{torchvulkan::Kernel::MATMUL_SIMD, result_dtype};
     d.subgroupSize = subgroup;
-    d.spd.push(MATMUL_WG)
-         .push(MATMUL_WG)
-         .push(isAligned)
-         .push(has_bias)
-         .push(static_cast<uint32_t>(activation))
-         .push(tile_m);
+    if (use_matmul_dot2(get_device_context(out), result_dtype))
+    {
+        // matmul_dot2_main loads 8 halves along K at a time (16 bytes), and an N-major B 4 halves along N (8 bytes),
+        // where every row start is aligned for it; otherwise it loads element by element
+        uint64_t address_a = get_batch_address(ops.self_b, b0);
+        uint64_t address_b = get_batch_address(ops.other_b, b0);
+        uint32_t b_kmajor = strides_b[1] == 1 && strides_b[2] != 1;
+        bool vec_a = strides_a[2] == 1 && strides_a[1] % 8 == 0 && strides_a[0] % 8 == 0 && address_a % 16 == 0;
+        bool vec_b = b_kmajor ? strides_b[2] % 8 == 0 && strides_b[0] % 8 == 0 && address_b % 16 == 0
+                              : strides_b[2] == 1 && strides_b[1] % 4 == 0 && strides_b[0] % 4 == 0 && address_b % 8 == 0;
+        d.key = ShaderKey{torchvulkan::Kernel::MATMUL_DOT2, result_dtype};
+        d.spd.push(MATMUL_DOT2_WG_X)
+             .push(MATMUL_DOT2_WG_Y)
+             .push(uint32_t(0)) // IS_ALIGNED: the epilogue reads the bias and writes the output through their strides
+             .push(has_bias)
+             .push(static_cast<uint32_t>(activation))
+             .push(tile_m)
+             .push(b_kmajor)
+             .push(uint32_t(vec_a && vec_b));
+    }
+    else
+    {
+        d.key = ShaderKey{torchvulkan::Kernel::MATMUL_SIMD, result_dtype};
+        d.spd.push(MATMUL_WG)
+             .push(MATMUL_WG)
+             .push(isAligned)
+             .push(has_bias)
+             .push(static_cast<uint32_t>(activation))
+             .push(tile_m);
+    }
 
     d.pcs.push(get_batch_address(ops.self_b, b0))
          .push(get_batch_address(ops.other_b, b0))
