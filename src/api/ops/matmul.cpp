@@ -203,8 +203,10 @@ TuneDispatch matmul_simd_dispatch(
 
     uint32_t vecSize = get_dtype_vec_size(result_dtype);
     uint32_t isBiasAligned = has_bias ? ops.bias_b.is_contiguous() : 1;
+    // F.linear's B = weight.t(): K-major, contiguous along K
+    uint32_t bKMajor = ops.other_b.stride(1) == 1 && ops.other_b.stride(2) != 1 && ops.other_b.transpose(1, 2).is_contiguous();
     uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
-                         ops.self_b.is_contiguous() && ops.other_b.is_contiguous() && isBiasAligned;
+                         ops.self_b.is_contiguous() && (ops.other_b.is_contiguous() || bKMajor) && isBiasAligned;
 
     uint32_t strides_a[4], strides_b[4], strides_c[4];
     uint32_t strides_bias[4] = {0, 0, 0, 0};
@@ -221,7 +223,9 @@ TuneDispatch matmul_simd_dispatch(
          .push(isAligned)
          .push(has_bias)
          .push(static_cast<uint32_t>(activation))
-         .push(tile_m);
+         .push(tile_m)
+         .at(7)
+         .push(bKMajor);
 
     d.pcs.push(get_batch_address(ops.self_b, b0))
          .push(get_batch_address(ops.other_b, b0))
