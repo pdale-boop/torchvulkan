@@ -12,6 +12,7 @@ import core.indexing;
 [[vk::constant_id(6)]] public const uint RMS = 0;
 [[vk::constant_id(7)]] public const uint STATS_ACCUM = 0;
 [[vk::constant_id(8)]] public const uint OUTPUTS = 0;
+[[vk::constant_id(9)]] public const uint SUBGROUP_ROWS = 0; // the workgroup is one subgroup, so sums use subgroup ops
 
 public static const int NORM_SMEM_SIZE = 256;
 public static const uint PARAM_COLUMNS = 32;
@@ -50,6 +51,7 @@ void storeStat<T : ITorchVulkan>(uint64_t address, uint i, T.Accum v)
 
 T.Accum blockSum<T : ITorchVulkan>(T.Accum v, uint lane, __ref T.Accum smem[NORM_SMEM_SIZE])
 {
+    if (SUBGROUP_ROWS == 1) return WaveActiveSum(v);
     GroupMemoryBarrierWithGroupSync();
     smem[lane] = v;
     GroupMemoryBarrierWithGroupSync();

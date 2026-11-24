@@ -59,10 +59,23 @@ uint32_t norm_workgroup_size(const DeviceContext* device)
     return size;
 }
 
+// Rows of at most this many elements per subgroup lane go one per subgroup-sized workgroup: a 256-wide workgroup on a
+// 128-wide row (an attention head's qk-norm) leaves most lanes idle and waits on barriers.
+const uint32_t SUBGROUP_ROW_ELEMENTS = 32;
+
+bool subgroup_rows(NormMode mode, const NormArgs& a, const DeviceContext* device)
+{
+    if (mode != NormMode::ROW_FORWARD && mode != NormMode::ROW_BACKWARD_INPUT) return false;
+    if (!device->support_subgroup_arithmetic || device->default_subgroup_size == 0) return false;
+    if (a.x.scalar_type() == at::kDouble) return false; // float64 sums would need 64-bit subgroup ops
+    return a.channels <= SUBGROUP_ROW_ELEMENTS * device->default_subgroup_size;
+}
+
 void dispatch_norm_shader(NormMode mode, const NormArgs& a, uint32_t groups)
 {
     DeviceContext* device = get_device_context(a.x);
-    uint32_t workgroupSizeX = norm_workgroup_size(device);
+    bool subgroup = subgroup_rows(mode, a, device);
+    uint32_t workgroupSizeX = subgroup ? device->default_subgroup_size : norm_workgroup_size(device);
     bool forward = mode == NormMode::BATCH_FORWARD || mode == NormMode::ROW_FORWARD;
 
     SpecializationBuilder spd{};
@@ -74,7 +87,8 @@ void dispatch_norm_shader(NormMode mode, const NormArgs& a, uint32_t groups)
        .push(static_cast<uint32_t>(a.update_running))
        .push(static_cast<uint32_t>(a.rms))
        .push(static_cast<uint32_t>(a.stats_accum))
-       .push(a.outputs);
+       .push(a.outputs)
+       .push(static_cast<uint32_t>(subgroup));
 
     PushConstantBuilder pcs{};
     pcs.push(address_or_zero(a.x))
