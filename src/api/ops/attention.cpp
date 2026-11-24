@@ -120,8 +120,66 @@ at::Tensor expanded_bias(const Attention& a)
     return a.bias.defined() ? a.bias.expand({a.B, a.Hq, a.L, a.S}) : at::Tensor();
 }
 
+// float16 and bfloat16 chunks stay in their dtype: the matmuls accumulate in float32 either way, and softmax_rows works
+// in float32 and writes each row's logsumexp, so only the scores and probabilities are rounded to the dtype. That halves
+// the memory traffic of the scores and lets the matmuls use the dtype's fast paths (packed dot products, coop matrices).
+bool low_precision_chunks(const Attention& a)
+{
+    return a.dtype != a.accumulate && a.accumulate == at::kFloat && torchvulkan::softmax_rows_supported(a.q);
+}
+
+// query rows per chunk of the low-precision path: about 128 MiB of scores, whatever the free-memory estimate says.
+// Klein's attention (24 heads x 4608 keys) is fastest from 512 rows a chunk on an RX 6800 XT and an RTX 5070 Ti; under
+// 256 the matmuls get too small (2-4x slower at 32 rows). The tuner still times this path against the fused one in place,
+// so where the scores would not fit, the fused kernel wins.
+int64_t low_precision_chunk_rows(const Attention& a)
+{
+    const int64_t row_elements = a.B * a.Hq * std::max<int64_t>(a.S, 1);
+    const int64_t row_bytes = row_elements * static_cast<int64_t>(c10::elementSize(a.dtype));
+    int64_t rows = (int64_t(128) << 20) / std::max<int64_t>(row_bytes, 1);
+    rows = std::min<int64_t>(rows, std::numeric_limits<int32_t>::max() / std::max<int64_t>(row_elements, 1));
+    return std::clamp<int64_t>(rows, 1, std::max<int64_t>(a.L, 1));
+}
+
+std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention& a, const at::Tensor& out)
+{
+    at::Tensor q = at::mul(a.q, a.scale);
+    at::Tensor bias = expanded_bias(a);
+    if (bias.defined()) bias = bias.to(a.dtype);
+    at::Tensor lse = at::empty({a.B, a.Hq, a.L}, a.q.options().dtype(a.accumulate));
+    const bool maskable = bias.defined() || a.causal;
+
+    const int64_t step = low_precision_chunk_rows(a);
+    for (int64_t r0 = 0; r0 < a.L; r0 += step) {
+        const int64_t rows = std::min(step, a.L - r0);
+        at::Tensor scores = at::matmul(by_kv_head(q.narrow(2, r0, rows), a), a.k.transpose(-2, -1)).reshape({a.B, a.Hq, rows, a.S});
+        if (bias.defined()) scores = at::add(scores, bias.narrow(2, r0, rows));
+        if (a.causal) {
+            at::TensorOptions index = scores.options().dtype(at::kLong);
+            at::Tensor row = at::arange(r0, r0 + rows, index).unsqueeze(1);
+            at::Tensor col = at::arange(0, a.S, index).unsqueeze(0);
+            scores = at::where(at::gt(col, row), at::scalar_tensor(neg_inf(), scores.options()), scores);
+        }
+        scores = scores.contiguous();
+        at::Tensor p = at::empty_like(scores);
+        at::Tensor l = at::empty({a.B, a.Hq, rows}, lse.options());
+        torchvulkan::softmax_rows(scores, p, /*log=*/false, l);
+        at::Tensor o = at::matmul(by_kv_head(p, a), a.v).reshape({a.B, a.Hq, rows, a.Dv});
+        if (maskable) {
+            // a row with every key masked attends to nothing: output 0 and logsumexp +inf, as the float32 path
+            at::Tensor empty = at::eq(l, neg_inf());
+            o = at::where(empty.unsqueeze(-1), at::scalar_tensor(0.0, o.options()), o);
+            l = at::where(empty, at::scalar_tensor(pos_inf(), l.options()), l);
+        }
+        out.narrow(2, r0, rows).copy_(o);
+        lse.narrow(2, r0, rows).copy_(l);
+    }
+    return {out, lse};
+}
+
 std::tuple<at::Tensor, at::Tensor> chunked_forward(const Attention& a, const at::Tensor& out)
 {
+    if (low_precision_chunks(a)) return chunked_forward_low_precision(a, out);
     at::Tensor q = a.q.to(a.accumulate);
     at::Tensor k = a.k.to(a.accumulate);
     at::Tensor v = a.v.to(a.accumulate);
@@ -521,7 +579,9 @@ std::optional<std::tuple<at::Tensor, at::Tensor>> fused_forward(Attention a)
         }
         if (tiling.splits > 1) merge_splits(a, tiling.splits, partial_out, partial_lse, out, lse);
     };
-    if (large_head(a) && chunked_is_faster(a, AttentionMode::FORWARD, shader, run, [&]() { chunked_forward(a, attention_output(a)); })) {
+    // low-precision chunks compete at every head size: matmuls on the dtype's fast path and the softmax kernel beat the
+    // fused SIMD and coop kernels at Klein's shape on an RX 6800 XT and an RTX 5070 Ti (2.3x and 2.9x)
+    if ((large_head(a) || low_precision_chunks(a)) && chunked_is_faster(a, AttentionMode::FORWARD, shader, run, [&]() { chunked_forward(a, attention_output(a)); })) {
         return std::nullopt;
     }
     run();
