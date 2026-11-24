@@ -249,7 +249,7 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
     }
 }
 
-FragmentAK<T> loadA<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint row, uint k)
+FragmentAK<T> loadA<T : ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint row, uint k)
 {
     T* tensor_a = (T*)pcs.tensor_a;
     uint idx = tile.batch_offset_a + row * pcs.strides_a.row + k * pcs.strides_a.col;
@@ -259,7 +259,7 @@ FragmentAK<T> loadA<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticT
     return m.Load<linalg::CoopMatMatrixLayout.RowMajor>(tensor_a, idx, pcs.strides_a.row);
 }
 
-FragmentBK<T> loadB<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint k, uint col)
+FragmentBK<T> loadB<T : ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan>(CoopTile tile, CoopPushConstants<TAcc> pcs, uint k, uint col)
 {
     T* tensor_b = (T*)pcs.tensor_b;
     uint idx = tile.batch_offset_b + k * pcs.strides_b.row + col * pcs.strides_b.col;
@@ -270,7 +270,7 @@ FragmentBK<T> loadB<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticT
 }
 
 // STEPS slices of K: all loads first, then all multiplies, so the loads overlap
-void accumulateSteps<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, let STEPS : uint>(
+void accumulateSteps<T : ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, let STEPS : uint>(
     CoopTile tile, CoopPushConstants<TAcc> pcs, uint a_rows[WARP_FRAGS_M], uint b_cols[WARP_FRAGS_N], uint k,
     inout Accumulator<TAcc> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
@@ -483,4 +483,77 @@ void int_mm_coop_main<T : ITorchVulkan & ICoopElement, let VEC : int>(
 {
     if (USE_SHARED_MEMORY == 1) coopMatmulStaged<T, int32_t, int32_t, VEC>(wg, ti, pcs);
     else coopMatmulDirect<T, int32_t, int32_t>(wg, ti, pcs);
+}
+
+// torch._scaled_mm: float8_e4m3fn operands loaded straight from memory (K a multiple of BK, checked by the host),
+// float32 accumulation, alpha = scale_a * scale_b read from the (one-element) scale tensors, a TOut result
+// the general CoopPushConstants plus two scale addresses would pass torchvulkan's 128-byte limit, so this carries only what
+// the kernel varies: the bias is a broadcast [N] row, alpha is scale_a * scale_b and beta 1
+struct ScaledMmPushConstants
+{
+    uint64_t tensor_a;
+    uint64_t tensor_b;
+    uint64_t tensor_out;
+    uint64_t tensor_bias;
+    uint64_t scale_a;
+    uint64_t scale_b;
+    TensorStrides strides_a;
+    TensorStrides strides_b;
+    TensorStrides strides_out;
+    uint m_dim;
+    uint n_dim;
+    uint k_dim;
+    uint padding;
+}
+
+[shader("compute")]
+[numthreads(WORKGROUP_SIZE, 1, 1)]
+void scaled_mm_coop_main<TOut : ITorchVulkan & ICoopElement>(
+    uint3 wg : SV_GroupID,
+    uint ti : SV_GroupIndex,
+    uniform ScaledMmPushConstants p)
+{
+    CoopPushConstants<float> pcs;
+    pcs.tensor_a = p.tensor_a;
+    pcs.tensor_b = p.tensor_b;
+    pcs.tensor_out = p.tensor_out;
+    pcs.tensor_bias = p.tensor_bias;
+    pcs.strides_a = p.strides_a;
+    pcs.strides_b = p.strides_b;
+    pcs.strides_out = p.strides_out;
+    pcs.strides_bias.batch = 0;
+    pcs.strides_bias.row = 0;
+    pcs.strides_bias.col = 1;
+    pcs.strides_bias.padding = 0;
+    pcs.m_dim = p.m_dim;
+    pcs.n_dim = p.n_dim;
+    pcs.k_dim = p.k_dim;
+    pcs.padding = 0;
+    pcs.alpha = ((float*)p.scale_a)[0] * ((float*)p.scale_b)[0];
+    pcs.beta = 1.0;
+    CoopTile tile = makeTile<float>(wg, ti, pcs);
+
+    Accumulator<float> acc[WARP_FRAGS_M * WARP_FRAGS_N];
+    [unroll] for (uint i = 0; i < WARP_FRAGS_M * WARP_FRAGS_N; ++i) acc[i] = Accumulator<float>(0.0);
+
+    uint a_rows[WARP_FRAGS_M];
+    [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
+    {
+        a_rows[mi] = tile.tile_m + tile.warp_row_base + mi * BLOCK_SIZE;
+        if (M_ALIGNED == 0) a_rows[mi] = min(a_rows[mi], pcs.m_dim - BLOCK_SIZE);
+    }
+    uint b_cols[WARP_FRAGS_N];
+    [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj)
+    {
+        b_cols[nj] = tile.tile_n + tile.warp_col_base + nj * BLOCK_SIZE;
+        if (N_ALIGNED == 0) b_cols[nj] = min(b_cols[nj], pcs.n_dim - BLOCK_SIZE);
+    }
+
+    uint k = 0;
+    for (; k + 8 * BLOCK_K <= pcs.k_dim; k += 8 * BLOCK_K) accumulateSteps<FloatE4M3, float, 8>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + 4 * BLOCK_K <= pcs.k_dim; k += 4 * BLOCK_K) accumulateSteps<FloatE4M3, float, 4>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + 2 * BLOCK_K <= pcs.k_dim; k += 2 * BLOCK_K) accumulateSteps<FloatE4M3, float, 2>(tile, pcs, a_rows, b_cols, k, acc);
+    for (; k + BLOCK_K <= pcs.k_dim; k += BLOCK_K) accumulateSteps<FloatE4M3, float, 1>(tile, pcs, a_rows, b_cols, k, acc);
+
+    finishTile<float, TOut>(wg, ti, tile, pcs, acc);
 }
