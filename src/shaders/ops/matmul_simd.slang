@@ -277,12 +277,10 @@ void matmul_dot2_plain_main<T : ITorchVulkan>(
 
 void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
 {
-    typealias Epilogue = LinearEpilogue<float, Activation<float>, AccumMatrix<half>>;
     const int TM = TILE_M / 16;
 
     AccumMatrix<half> bias = AccumMatrix<half>(pcs.tensor_bias, pcs.strides_bias);
     AccumMatrix<half> out = AccumMatrix<half>(pcs.tensor_out, pcs.strides_C);
-    Epilogue epilogue = Epilogue(pcs.alpha, pcs.beta, bias);
 
     uint batch = wg.z;
     uint m0 = wg.y * TILE_M;
@@ -371,10 +369,20 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
         if (i >= TM) break;
         uint row = m0 + row0 + i;
         if (row >= pcs.M) continue;
+        // the row's bias is read before any of it is stored, so its 16 loads are in flight together (stores may alias
+        // the bias, so the compiler otherwise waits on each load in turn); columns past N read column N - 1
+        float bv[D2_TN];
         [ForceUnroll] for (int j = 0; j < D2_TN; j++)
         {
             uint col = n0 + col0 + 32 * (j / 4) + j % 4;
-            if (col < pcs.N) out.store(batch, row, col, epilogue.apply(batch, row, col, acc[i][j]));
+            bv[j] = HAS_BIAS == 1 ? bias.load(batch, row, min(col, pcs.N - 1)) : 0.0;
+        }
+        [ForceUnroll] for (int j = 0; j < D2_TN; j++)
+        {
+            uint col = n0 + col0 + 32 * (j / 4) + j % 4;
+            float value = acc[i][j] * pcs.alpha;
+            if (HAS_BIAS == 1) value = value + bv[j] * pcs.beta;
+            if (col < pcs.N) out.store(batch, row, col, Activation<float>.eval(value));
         }
     }
 }
