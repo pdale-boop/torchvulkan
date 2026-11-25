@@ -948,13 +948,23 @@ at::Tensor& int_mm_out_vulkan(const at::Tensor& self, const at::Tensor& mat2, at
     return out;
 }
 
-// float8_e4m3fn cooperative-matrix shapes with float32 accumulation, as {block (M = N), K}
-std::vector<std::pair<uint32_t, uint32_t>> float8_coop_shapes(DeviceContext* device)
+// float8_e4m3fn cooperative-matrix shapes with float32 accumulation, as {block (M = N), K}, where the output dtype has
+// a block x block matrix too: the epilogue's direct store declares one (VUID-RuntimeSpirv-OpTypeCooperativeMatrixKHR-08974)
+std::vector<std::pair<uint32_t, uint32_t>> float8_coop_shapes(DeviceContext* device, at::ScalarType out)
 {
     std::vector<std::pair<uint32_t, uint32_t>> shapes;
     if (!device->support_float8_coopmat) return shapes;
+    auto has_square = [&](uint32_t block) {
+        for (const CoopMatShape& s : device->coopmat_shapes) {
+            if ((s.c == out || s.result == out) && s.m == block && s.n == block) return true;
+            if (s.a == out && s.m == block && s.k == block) return true;
+            if (s.b == out && s.k == block && s.n == block) return true;
+        }
+        return false;
+    };
     for (const CoopMatShape& s : device->coopmat_shapes) {
         if (s.a != at::kFloat8_e4m3fn || s.b != at::kFloat8_e4m3fn || s.c != at::kFloat || s.result != at::kFloat || s.m != s.n) continue;
+        if (!has_square(s.m)) continue;
         std::pair<uint32_t, uint32_t> shape{s.m, s.k};
         if (std::find(shapes.begin(), shapes.end(), shape) == shapes.end()) shapes.push_back(shape);
     }
@@ -962,8 +972,8 @@ std::vector<std::pair<uint32_t, uint32_t>> float8_coop_shapes(DeviceContext* dev
 }
 
 // _scaled_mm's fast path, with one scale per operand: float8_e4m3fn [M, K] x float8_e4m3fn [K, N] -> out_dtype,
-// (a @ b) * scale_a * scale_b (+ bias), on float8 cooperative matrices (VK_EXT_shader_float8). The fragments load straight
-// from memory, so K has to be a multiple of their K. Returns nothing where it doesn't apply, for the emulation to run.
+// (a @ b) * scale_a * scale_b (+ bias), on float8 cooperative matrices (VK_EXT_shader_float8). Returns nothing where it
+// doesn't apply, for the emulation to run.
 std::optional<at::Tensor> scaled_mm_float8_coop(
     const at::Tensor& self,
     const at::Tensor& mat2,
@@ -973,38 +983,34 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
     const std::optional<at::Tensor>& scale_result,
     std::optional<at::ScalarType> out_dtype)
 {
-    if (!(self.dim() == 2 && mat2.dim() == 2)) return std::nullopt;
-    if (!(self.scalar_type() == at::kFloat8_e4m3fn && mat2.scalar_type() == at::kFloat8_e4m3fn)) return std::nullopt;
-    if (!(self.size(1) == mat2.size(0))) return std::nullopt;
-    if (!(scale_a.numel() == 1 && scale_b.numel() == 1 && scale_a.scalar_type() == at::kFloat && scale_b.scalar_type() == at::kFloat)) return std::nullopt;
-    if (!(!scale_result.has_value() || !scale_result->defined())) return std::nullopt;
-    const at::ScalarType dtype = out_dtype.value_or(at::kBFloat16);
-    if (!(dtype == at::kBFloat16 || dtype == at::kHalf || dtype == at::kFloat)) return std::nullopt;
+    if (self.dim() != 2 || mat2.dim() != 2 || self.size(1) != mat2.size(0)) return std::nullopt;
+    if (self.scalar_type() != at::kFloat8_e4m3fn || mat2.scalar_type() != at::kFloat8_e4m3fn) return std::nullopt;
+    if (scale_a.numel() != 1 || scale_b.numel() != 1 || scale_a.scalar_type() != at::kFloat || scale_b.scalar_type() != at::kFloat) return std::nullopt;
+    if (scale_result.has_value() && scale_result->defined()) return std::nullopt;
+    const bool has_bias = bias.has_value() && bias->defined();
+    for (const at::Tensor& t : {mat2, scale_a, scale_b}) if (t.device() != self.device()) return std::nullopt;
+    if (has_bias && (bias->device() != self.device() || bias->dim() != 1 || bias->size(0) != mat2.size(1))) return std::nullopt;
+    // torch's default is the operands' dtype, and a float8 result is left to the emulation
+    const at::ScalarType dtype = out_dtype.value_or(self.scalar_type());
+    if (dtype != at::kBFloat16 && dtype != at::kHalf && dtype != at::kFloat) return std::nullopt;
     const int64_t M = self.size(0), K = self.size(1), N = mat2.size(1);
+    if (M == 0 || N == 0 || K == 0) return std::nullopt;
 
     DeviceContext* device = get_device_context(self);
-    if (!(is_dtype_supported(device, dtype))) return std::nullopt;
-    std::vector<std::pair<uint32_t, uint32_t>> shapes = float8_coop_shapes(device);
-    if (!(!shapes.empty())) return std::nullopt;
-    if (!(M > 0 && N > 0 && K > 0)) return std::nullopt;
+    // the kernel stages and loads the float8 bytes as int8_t
+    if (!is_dtype_supported(device, dtype) || !is_dtype_supported(device, at::kChar)) return std::nullopt;
+    std::vector<std::pair<uint32_t, uint32_t>> shapes = float8_coop_shapes(device, dtype);
+    if (shapes.empty()) return std::nullopt;
 
     at::Tensor out = at::empty({M, N}, self.options().dtype(dtype));
-
     at::Tensor a = self.unsqueeze(0), b = mat2.unsqueeze(0), c = out.unsqueeze(0);
     auto loadable = [](const at::Tensor& t) { return t.stride(-1) == 1 || t.stride(-2) == 1; };
-    if (!(loadable(a) && loadable(b))) return std::nullopt;
+    if (!loadable(a) || !loadable(b) || !fits_32bit_indexing({a, b, c})) return std::nullopt;
     uint32_t a_transposed = coop_transposed(a) ? 1 : 0;
     uint32_t b_transposed = coop_transposed(b) ? 1 : 0;
-    if (!(coop_aligned(a, a_transposed) && coop_aligned(b, b_transposed))) return std::nullopt;
-    if (!(fits_32bit_indexing({a, b, c}))) return std::nullopt;
-
-    at::Tensor bias_t;
-    uint32_t has_bias = 0;
-    if (bias.has_value() && bias->defined()) {
-        if (!(bias->dim() == 1 && bias->size(0) == N)) return std::nullopt;
-        bias_t = bias->to(dtype).contiguous();
-        has_bias = 1;
-    }
+    // the direct path's fragments load straight from memory; the staged one takes any layout
+    bool direct_aligned = coop_aligned(a, a_transposed) && coop_aligned(b, b_transposed);
+    at::Tensor bias_t = has_bias ? bias->to(dtype).contiguous() : at::Tensor();
     uint32_t strides_a[4], strides_b[4], strides_out[4];
     strides_of(a, strides_a);
     strides_of(b, strides_b);
@@ -1040,7 +1046,7 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
              .push(t.bk)
              .push(uint32_t(1)) // HAS_ALPHA: scale_a * scale_b
              .push(uint32_t(0)) // ACTIVATION
-             .push(has_bias)
+             .push(uint32_t(has_bias))
              .push(a_transposed)
              .push(b_transposed)
              .push(coop_aligned(c, false) ? uint32_t(1) : uint32_t(0))
@@ -1106,8 +1112,8 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
         uint64_t stage_b = b_transposed ? tile_n * (t.bk + pad) : t.bk * (tile_n + pad);
         uint64_t staged = t.shared ? 2 * (stage_a + stage_b) : tile_m * t.bk + t.bk * tile_n;
         uint64_t shared_bytes = staged + sizeof(float) * subgroups * t.block * t.block;
-        if (t.bk % block_k != 0 || K % t.bk != 0 || shared_bytes > limits.maxComputeSharedMemorySize) return false;
-        if (!t.shared && ((1u << m_align) % t.block != 0 || (1u << n_align) % t.block != 0)) return false;
+        if (t.bk % block_k != 0 || shared_bytes > limits.maxComputeSharedMemorySize) return false;
+        if (!t.shared && (!direct_aligned || (1u << m_align) % t.block != 0 || (1u << n_align) % t.block != 0)) return false;
         if (subgroups > 8 || !fits_workgroup_size(device, coop_threads(t), t.subgroup)) return false;
         if (tile_m > std::max<uint64_t>(2 * max_m, t.block) || tile_n > std::max<uint64_t>(2 * max_n, t.block)) return false;
         if (ceil_div(max_n, tile_n) > limits.maxComputeWorkGroupCount[0] || ceil_div(max_m, tile_m) > limits.maxComputeWorkGroupCount[1]) return false;
@@ -1115,9 +1121,9 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
     };
 
     uint64_t key = a_transposed | (b_transposed << 1) | (log2_ceil(M) << 8) | (log2_ceil(N) << 16) | (log2_ceil(K) << 24) |
-        (m_align << 40) | (n_align << 43) | (uint64_t(has_bias) << 46) | (uint64_t(K % 128 == 0) << 47) | (uint64_t(K % 64 == 0) << 48);
+        (m_align << 40) | (n_align << 43) | (uint64_t(has_bias) << 46) | (uint64_t(direct_aligned) << 47);
     const TuneConfig& config = device->tuner->select(ShaderKey{torchvulkan::Kernel::SCALED_MM_COOP, dtype}, key, space, make_dispatch);
-    if (!(!config.empty())) return std::nullopt;
+    if (config.empty()) return std::nullopt;
     dispatch_tuned_shader(device, make_dispatch(config));
     return out;
 }
