@@ -34,6 +34,18 @@ typedef struct VkPhysicalDeviceShaderBfloat16FeaturesKHR {
 } VkPhysicalDeviceShaderBfloat16FeaturesKHR;
 #endif
 
+// VK_EXT_shader_float8 likewise (the Windows CI's SDK 1.3.296 lacks it)
+#ifndef VK_EXT_shader_float8
+#define VK_EXT_SHADER_FLOAT8_EXTENSION_NAME "VK_EXT_shader_float8"
+static constexpr VkStructureType VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT = static_cast<VkStructureType>(1000567000);
+typedef struct VkPhysicalDeviceShaderFloat8FeaturesEXT {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           shaderFloat8;
+    VkBool32           shaderFloat8CooperativeMatrix;
+} VkPhysicalDeviceShaderFloat8FeaturesEXT;
+#endif
+
 thread_local c10::DeviceIndex VulkanContext::currentDeviceIndex;
 
 static bool isEnvSet(const char* name)
@@ -67,6 +79,8 @@ static VkResult loadVulkan()
 }
 
 inline constexpr VkComponentTypeKHR COMPONENT_TYPE_BFLOAT16 = static_cast<VkComponentTypeKHR>(1000141000);
+inline constexpr VkComponentTypeKHR COMPONENT_TYPE_FLOAT8_E4M3 = static_cast<VkComponentTypeKHR>(1000491002);
+inline constexpr VkComponentTypeKHR COMPONENT_TYPE_FLOAT8_E5M2 = static_cast<VkComponentTypeKHR>(1000491003);
 
 static c10::ScalarType coop_component_to_scalar(VkComponentTypeKHR type)
 {
@@ -75,8 +89,8 @@ static c10::ScalarType coop_component_to_scalar(VkComponentTypeKHR type)
         case VK_COMPONENT_TYPE_FLOAT32_KHR: return at::ScalarType::Float;
         case VK_COMPONENT_TYPE_FLOAT64_KHR: return at::ScalarType::Double;
         case COMPONENT_TYPE_BFLOAT16:       return at::ScalarType::BFloat16;
-        case VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT: return at::ScalarType::Float8_e4m3fn;
-        case VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT: return at::ScalarType::Float8_e5m2;
+        case COMPONENT_TYPE_FLOAT8_E4M3:    return at::ScalarType::Float8_e4m3fn;
+        case COMPONENT_TYPE_FLOAT8_E5M2:    return at::ScalarType::Float8_e5m2;
         case VK_COMPONENT_TYPE_SINT8_KHR:   return at::ScalarType::Char;
         case VK_COMPONENT_TYPE_SINT16_KHR:  return at::ScalarType::Short;
         case VK_COMPONENT_TYPE_SINT32_KHR:  return at::ScalarType::Int;
