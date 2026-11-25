@@ -125,48 +125,68 @@ at::Tensor expanded_bias(const Attention& a)
 // the memory traffic of the scores and lets the matmuls use the dtype's fast paths (packed dot products, coop matrices).
 bool low_precision_chunks(const Attention& a)
 {
-    return a.dtype != a.accumulate && a.accumulate == at::kFloat && torchvulkan::softmax_rows_supported(a.q);
+    return a.dtype != a.accumulate && a.accumulate == at::kFloat && torchvulkan::softmax_rows_supported(a.q) &&
+           a.B * a.group * a.S <= std::numeric_limits<int32_t>::max();
 }
 
-// query rows per chunk of the low-precision path: about 128 MiB of scores, whatever the free-memory estimate says.
-// Klein's attention (24 heads x 4608 keys) is fastest from 512 rows a chunk on an RX 6800 XT and an RTX 5070 Ti; under
-// 256 the matmuls get too small (2-4x slower at 32 rows). The tuner still times this path against the fused one in place,
-// so where the scores would not fit, the fused kernel wins.
-int64_t low_precision_chunk_rows(const Attention& a)
+struct ChunkShape {
+    int64_t heads; // key/value heads
+    int64_t rows;  // query rows
+};
+
+// About 128 MiB of scores a chunk, whatever the free-memory estimate says: whole key/value heads while they fit, else
+// query rows of one head, so the matmuls stay large at any sequence length (Klein's attention is fastest from 512 rows
+// a chunk on an RX 6800 XT and an RTX 5070 Ti, and 2-4x slower at 32). Even chunks, so the matmuls see one shape.
+ChunkShape low_precision_chunk_shape(const Attention& a)
 {
-    const int64_t row_elements = a.B * a.Hq * std::max<int64_t>(a.S, 1);
-    const int64_t row_bytes = row_elements * static_cast<int64_t>(c10::elementSize(a.dtype));
-    int64_t rows = (int64_t(128) << 20) / std::max<int64_t>(row_bytes, 1);
-    rows = std::min<int64_t>(rows, std::numeric_limits<int32_t>::max() / std::max<int64_t>(row_elements, 1));
-    return std::clamp<int64_t>(rows, 1, std::max<int64_t>(a.L, 1));
+    const int64_t budget = (int64_t(128) << 20) / static_cast<int64_t>(c10::elementSize(a.dtype));
+    // the scores of one query row in each query head of one key/value head
+    const int64_t row = std::max<int64_t>(a.B * a.group * a.S, 1);
+    const int64_t L = std::max<int64_t>(a.L, 1);
+    if (row * L <= budget) {
+        const int64_t heads = std::min(budget / (row * L), a.Hk);
+        return {ceil_div(a.Hk, ceil_div(a.Hk, heads)), L};
+    }
+    int64_t rows = ceil_div(L, ceil_div(L, std::max<int64_t>(budget / row, 1)));
+    if (rows > 64) rows = std::min(round_up(rows, 64), L);
+    return {1, rows};
 }
 
 std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention& a, const at::Tensor& out)
 {
-    at::Tensor q = at::mul(a.q, a.scale);
     at::Tensor bias = expanded_bias(a);
-    if (bias.defined()) bias = bias.to(a.dtype);
     at::Tensor lse = at::empty({a.B, a.Hq, a.L}, a.q.options().dtype(a.accumulate));
+    // with beta 0 baddbmm ignores its input; alpha scales the float32 products before they're rounded to the dtype
+    at::Tensor unused = at::empty({1, 1, 1}, a.q.options());
 
-    const int64_t step = low_precision_chunk_rows(a);
-    for (int64_t r0 = 0; r0 < a.L; r0 += step) {
-        const int64_t rows = std::min(step, a.L - r0);
-        at::Tensor scores = at::matmul(by_kv_head(q.narrow(2, r0, rows), a), a.k.transpose(-2, -1)).reshape({a.B, a.Hq, rows, a.S});
-        if (bias.defined()) scores = at::add(scores, bias.narrow(2, r0, rows));
-        if (a.causal) {
-            at::TensorOptions index = scores.options().dtype(at::kLong);
-            at::Tensor row = at::arange(r0, r0 + rows, index).unsqueeze(1);
-            at::Tensor col = at::arange(0, a.S, index).unsqueeze(0);
-            scores = at::where(at::gt(col, row), at::scalar_tensor(neg_inf(), scores.options()), scores);
+    const ChunkShape chunk = low_precision_chunk_shape(a);
+    for (int64_t h0 = 0; h0 < a.Hk; h0 += chunk.heads) {
+        const int64_t heads = std::min(chunk.heads, a.Hk - h0);
+        const int64_t hq0 = h0 * a.group;
+        const int64_t hq = heads * a.group;
+        at::Tensor k = a.k.narrow(1, h0, heads).reshape({a.B * heads, a.S, a.D}).transpose(1, 2);
+        at::Tensor v = a.v.narrow(1, h0, heads).reshape({a.B * heads, a.S, a.Dv});
+        for (int64_t r0 = 0; r0 < a.L; r0 += chunk.rows) {
+            const int64_t rows = std::min(chunk.rows, a.L - r0);
+            // each key/value head's query heads one after another: [B * heads, group * rows, D]
+            at::Tensor q = a.q.narrow(1, hq0, hq).narrow(2, r0, rows).reshape({a.B * heads, a.group * rows, a.D});
+            at::Tensor scores = at::baddbmm(unused, q, k, /*beta=*/0, /*alpha=*/a.scale).view({a.B, hq, rows, a.S});
+            if (bias.defined()) scores = at::add(scores, bias.narrow(1, hq0, hq).narrow(2, r0, rows));
+            if (a.causal) {
+                at::TensorOptions index = scores.options().dtype(at::kLong);
+                at::Tensor row = at::arange(r0, r0 + rows, index).unsqueeze(1);
+                at::Tensor col = at::arange(0, a.S, index).unsqueeze(0);
+                scores = at::where(at::gt(col, row), at::scalar_tensor(neg_inf(), scores.options()), scores);
+            }
+            scores = scores.contiguous();
+            at::Tensor l = at::empty({a.B, hq, rows}, lse.options());
+            // probabilities in place of the scores; a row with every key masked attends to nothing: probabilities 0, so
+            // output 0, and logsumexp +inf
+            torchvulkan::softmax_rows(scores, scores, /*log=*/false, l, /*masked_zero=*/true);
+            at::Tensor o = at::bmm(scores.view({a.B * heads, a.group * rows, a.S}), v).view({a.B, hq, rows, a.Dv});
+            out.narrow(1, hq0, hq).narrow(2, r0, rows).copy_(o);
+            lse.narrow(1, hq0, hq).narrow(2, r0, rows).copy_(l);
         }
-        scores = scores.contiguous();
-        at::Tensor p = at::empty_like(scores);
-        at::Tensor l = at::empty({a.B, a.Hq, rows}, lse.options());
-        // a row with every key masked attends to nothing: probabilities 0, so output 0, and logsumexp +inf
-        torchvulkan::softmax_rows(scores, p, /*log=*/false, l, /*masked_zero=*/true);
-        at::Tensor o = at::matmul(by_kv_head(p, a), a.v).reshape({a.B, a.Hq, rows, a.Dv});
-        out.narrow(2, r0, rows).copy_(o);
-        lse.narrow(2, r0, rows).copy_(l);
     }
     return {out, lse};
 }
