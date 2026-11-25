@@ -222,6 +222,8 @@ double Autotuner::time_work(const std::function<void()>& work)
         return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
     };
     device->flush();
+    // the warm-up may tune and compile the ops the work uses, so it can't size the runs
+    once();
     const double estimate = std::max(once(), 1.0);
     std::vector<double> times(std::clamp<size_t>(static_cast<size_t>(FULL_TIMING_TARGET_NS / estimate), 1, MAX_TIMING_SPANS));
     for (double& time : times) time = once();
