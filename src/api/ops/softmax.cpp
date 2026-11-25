@@ -19,14 +19,33 @@ void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, cons
     const int64_t rows = input.numel() / std::max<int64_t>(length, 1);
     if (rows == 0) return;
     const bool out_accum = out.scalar_type() == at::kFloat && input.scalar_type() != at::kFloat;
+    TORCH_CHECK(out.numel() == input.numel() && (out_accum || out.scalar_type() == input.scalar_type()),
+                "torchvulkan [ERROR]: softmax_rows' out must be the input's shape, in its dtype or float32.");
     const bool write_lse = lse.defined();
     TORCH_CHECK(!write_lse || (lse.is_contiguous() && lse.scalar_type() == at::kFloat && lse.numel() == rows),
                 "torchvulkan [ERROR]: softmax_rows' lse must be one contiguous float32 per row.");
 
     DeviceContext* device = get_device_context(input);
-    const uint32_t workgroup = length >= 1024 ? 256 : length >= 256 ? 128 : 64;
+    // a thread takes vec elements per step; about two steps per thread, from one subgroup (64 without subgroup
+    // arithmetic) up to 256 threads a row
+    const int64_t vec = get_dtype_vec_size(input.scalar_type());
+    const uint32_t subgroup = device->default_subgroup_size;
+    const bool subgroup_reduce = device->support_subgroup_arithmetic && subgroup > 0 && subgroup <= 256;
+    uint32_t workgroup = subgroup_reduce ? subgroup : 64;
+    while (workgroup < 256 && workgroup * vec * 2 < length) workgroup *= 2;
+    const int64_t steps = (length + workgroup * vec - 1) / (workgroup * vec);
+    const bool cached = steps <= 8; // MAX_STEPS in softmax.slang
+    const uint64_t in_bytes = vec * input.element_size(), out_bytes = vec * out.element_size();
+    const bool vec_aligned = length % vec == 0 && get_tensor_address(input) % in_bytes == 0 &&
+                             get_output_address(out) % out_bytes == 0;
     SpecializationBuilder spd{};
-    spd.push(workgroup).push(uint32_t(log)).push(uint32_t(out_accum)).push(uint32_t(write_lse));
+    spd.push(workgroup)
+        .push(uint32_t(log))
+        .push(uint32_t(out_accum))
+        .push(uint32_t(write_lse))
+        .push(uint32_t(subgroup_reduce))
+        .push(uint32_t(vec_aligned))
+        .push(uint32_t(cached));
     PushConstantBuilder pcs{};
     pcs.push(get_tensor_address(input))
         .push(get_output_address(out))
