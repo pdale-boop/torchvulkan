@@ -10,6 +10,8 @@ __exported import helpers.unary_ops;
 [[vk::constant_id(3)]] public const uint HAS_BIAS = 0;
 [[vk::constant_id(4)]] public const uint ACTIVATION = 0;
 [[vk::constant_id(5)]] public const uint TILE_M = 128;
+// matmul only (conv_simd uses id 6): B's K dimension is the contiguous one (F.linear's w.t()), so its tile loads along K
+[[vk::constant_id(7)]] public const uint B_KMAJOR = 0;
 
 public static const int TILE_N = 128;
 public static const int TILE_K = 16;

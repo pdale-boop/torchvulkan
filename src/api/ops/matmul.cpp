@@ -157,6 +157,9 @@ bool fits_matmul_indexing(const MatmulOperands& ops, const at::Tensor& out)
 const uint32_t MATMUL_TILE_N = 128;
 const uint32_t MATMUL_TILE_K = 16;
 const uint32_t MATMUL_WG = 16;
+// matmul_dot2_main: 8 threads along N (16 columns each) by 16 along M
+const uint32_t MATMUL_DOT2_WG_X = 8;
+const uint32_t MATMUL_DOT2_WG_Y = 16;
 
 void strides_of(const at::Tensor& t, uint32_t (&strides)[4])
 {
@@ -183,6 +186,24 @@ bool matmul_simd_fits(DeviceContext* device, c10::ScalarType compute_type, uint3
     return !device->support_subgroup_control || MATMUL_WG * MATMUL_WG <= subgroup * device->max_workgroup_subgroups;
 }
 
+enum class Dot2Kind { None, Valve, Plain };
+
+// float16 matmuls can run on packed dot products: through VK_VALVE_shader_mixed_float_dot_product where the driver
+// exposes it, else on AMD in plain float math, which AMD's Windows compiler turns into the same instruction
+Dot2Kind matmul_dot2_kind(DeviceContext* device, c10::ScalarType dtype)
+{
+    if (dtype != at::kHalf || !device->support_float16) return Dot2Kind::None;
+    if (device->support_dot2_f16_f32) return Dot2Kind::Valve;
+    return device->properties.vendorID == 0x1002 ? Dot2Kind::Plain : Dot2Kind::None;
+}
+
+// the tuners' dot2 parameter: 1 runs the dot2 kernel instead of the SIMD kernel, so devices where it is slower keep SIMD
+std::vector<uint32_t> matmul_dot2_options(DeviceContext* device, c10::ScalarType dtype)
+{
+    if (matmul_dot2_kind(device, dtype) == Dot2Kind::None) return {0};
+    return {0, 1};
+}
+
 // the cooperative-matrix tuner times this too: emulated cooperative matrices can lose to it by far
 TuneDispatch matmul_simd_dispatch(
     const MatmulOperands& ops,
@@ -193,6 +214,7 @@ TuneDispatch matmul_simd_dispatch(
     const at::Scalar& beta,
     uint32_t tile_m,
     uint32_t subgroup,
+    uint32_t use_dot2,
     int64_t b0,
     int64_t batch)
 {
@@ -215,14 +237,40 @@ TuneDispatch matmul_simd_dispatch(
     if (has_bias) strides_of(ops.bias_b, strides_bias);
 
     TuneDispatch d;
-    d.key = ShaderKey{torchvulkan::Kernel::MATMUL_SIMD, result_dtype};
     d.subgroupSize = subgroup;
-    d.spd.push(MATMUL_WG)
-         .push(MATMUL_WG)
-         .push(isAligned)
-         .push(has_bias)
-         .push(static_cast<uint32_t>(activation))
-         .push(tile_m);
+    Dot2Kind dot2 = use_dot2 ? matmul_dot2_kind(get_device_context(out), result_dtype) : Dot2Kind::None;
+    if (dot2 != Dot2Kind::None)
+    {
+        // matmul_dot2_main loads 8 halves along K at a time (16 bytes), and an N-major B 4 halves along N (8 bytes),
+        // where every row start is aligned for it; otherwise it loads element by element
+        uint64_t address_a = get_batch_address(ops.self_b, b0);
+        uint64_t address_b = get_batch_address(ops.other_b, b0);
+        uint32_t b_kmajor = strides_b[1] == 1 && strides_b[2] != 1;
+        bool vec_a = strides_a[2] == 1 && strides_a[1] % 8 == 0 && strides_a[0] % 8 == 0 && address_a % 16 == 0;
+        bool vec_b = b_kmajor ? strides_b[2] % 8 == 0 && strides_b[0] % 8 == 0 && address_b % 16 == 0
+                              : strides_b[2] == 1 && strides_b[1] % 4 == 0 && strides_b[0] % 4 == 0 && address_b % 8 == 0;
+        d.key = ShaderKey{dot2 == Dot2Kind::Valve ? torchvulkan::Kernel::MATMUL_DOT2 : torchvulkan::Kernel::MATMUL_DOT2_PLAIN, result_dtype};
+        d.spd.push(MATMUL_DOT2_WG_X)
+             .push(MATMUL_DOT2_WG_Y)
+             .push(uint32_t(0)) // IS_ALIGNED: the epilogue reads the bias and writes the output through their strides
+             .push(has_bias)
+             .push(static_cast<uint32_t>(activation))
+             .push(tile_m)
+             .at(7)
+             .push(b_kmajor)
+             .at(9)
+             .push(uint32_t(vec_a && vec_b));
+    }
+    else
+    {
+        d.key = ShaderKey{torchvulkan::Kernel::MATMUL_SIMD, result_dtype};
+        d.spd.push(MATMUL_WG)
+             .push(MATMUL_WG)
+             .push(isAligned)
+             .push(has_bias)
+             .push(static_cast<uint32_t>(activation))
+             .push(tile_m);
+    }
 
     d.pcs.push(get_batch_address(ops.self_b, b0))
          .push(get_batch_address(ops.other_b, b0))
@@ -298,13 +346,14 @@ at::Tensor dispatch_matmul_simd_shader(
 
     materialize_cow(out);
     auto make_dispatch = [&](const TuneConfig& config, int64_t b0, int64_t batch) {
-        return matmul_simd_dispatch(ops, out, has_bias, activation, alpha, beta, config[0], config[1], b0, batch);
+        return matmul_simd_dispatch(ops, out, has_bias, activation, alpha, beta, config[0], config[1], config[2], b0, batch);
     };
 
     TuneSpace space;
     space.params = {
         {"tile_m", {128, 64}},
         {"subgroup", subgroup_size_options(device)},
+        {"dot2", matmul_dot2_options(device, result_dtype)},
     };
     space.valid = [&](const TuneConfig& config) { return matmul_simd_fits(device, compute_type, config[0], config[1], M, N); };
 
@@ -438,7 +487,7 @@ at::Tensor dispatch_matmul_coop_shader(
 
     materialize_cow(out);
     auto make_dispatch = [&](const TuneConfig& config, int64_t b0, int64_t batch) {
-        if (!matmul_coop_kernel(config)) return matmul_simd_dispatch(ops, out, has_bias, activation, alpha, beta, config[9], config[7], b0, batch);
+        if (!matmul_coop_kernel(config)) return matmul_simd_dispatch(ops, out, has_bias, activation, alpha, beta, config[9], config[7], config[10], b0, batch);
         CoopTiling t = matmul_coop_tiling(config);
         uint32_t tile_m = coop_tile_m(t);
         uint32_t tile_n = coop_tile_n(t);
@@ -509,6 +558,7 @@ at::Tensor dispatch_matmul_coop_shader(
         {"subgroup", subgroup_size_options(device)},
         {"kernel", {0, 1}},
         {"simd_tile_m", {128, 64}},
+        {"simd_dot2", matmul_dot2_options(device, promoted_type)},
     };
     space.kernel_param = 8;
     space.valid = [&](const TuneConfig& config) {
@@ -517,7 +567,7 @@ at::Tensor dispatch_matmul_coop_shader(
             if (i != 7 && !matmul_coop_kernel(config) && config[i] != space.params[i].options.front()) return false;
         }
         if (!matmul_coop_kernel(config)) return matmul_simd_fits(device, accumulate_type, config[9], config[7], M, N);
-        if (config[9] != space.params[9].options.front()) return false;
+        if (config[9] != space.params[9].options.front() || config[10] != space.params[10].options.front()) return false;
 
         CoopTiling t = matmul_coop_tiling(config);
         uint64_t subgroups = t.warps_m * t.warps_n;
