@@ -185,6 +185,14 @@ void storeTile<T : ITorchVulkan & ICoopElement, let VEC : int>(
 void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, let VEC : int>(
     uint ti, CoopTile tile, CoopPushConstants<TAcc> pcs, inout Accumulator<TAcc> acc[WARP_FRAGS_M * WARP_FRAGS_N])
 {
+    accumulateStagedAs<T, T, TAcc, VEC>(ti, tile, pcs, acc);
+}
+
+// stages tiles of T and loads the fragments from shared memory as TF: float8 stages its bytes as int8_t, since a
+// cooperative-matrix load may read a shared array of another element type
+void accumulateStagedAs<T : ITorchVulkan & ICoopElement, TF : ICoopElement, TAcc : __BuiltinArithmeticType & ITorchVulkan, let VEC : int>(
+    uint ti, CoopTile tile, CoopPushConstants<TAcc> pcs, inout Accumulator<TAcc> acc[WARP_FRAGS_M * WARP_FRAGS_N])
+{
     vector<T, VEC> regA[LOADS_A];
     vector<T, VEC> regB[LOADS_B];
 
@@ -205,7 +213,7 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
         uint base_b = stage * stageB();
         for (uint step = 0; step < BK; step += BLOCK_K)
         {
-            FragmentAK<T> matA[WARP_FRAGS_M];
+            FragmentAK<TF> matA[WARP_FRAGS_M];
             [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
             {
                 uint row = tile.warp_row_base + mi * BLOCK_SIZE;
@@ -219,7 +227,7 @@ void accumulateStaged<T : ITorchVulkan & ICoopElement, TAcc : __BuiltinArithmeti
                 }
             }
 
-            FragmentBK<T> matB[WARP_FRAGS_N];
+            FragmentBK<TF> matB[WARP_FRAGS_N];
             [unroll] for (uint nj = 0; nj < WARP_FRAGS_N; ++nj)
             {
                 uint col = tile.warp_col_base + nj * BLOCK_SIZE;
@@ -535,6 +543,15 @@ void scaled_mm_coop_main<TOut : ITorchVulkan & ICoopElement>(
 
     Accumulator<float> acc[WARP_FRAGS_M * WARP_FRAGS_N];
     [unroll] for (uint i = 0; i < WARP_FRAGS_M * WARP_FRAGS_N; ++i) acc[i] = Accumulator<float>(0.0);
+
+    if (USE_SHARED_MEMORY == 1)
+    {
+        // VEC 4 = VEC_SIZE_FOR_BYTES[1], the host's int8 vector size for LOADS_A / LOADS_B
+        GroupMemoryBarrierWithGroupSync();
+        accumulateStagedAs<int8_t, FloatE4M3, float, 4>(ti, tile, pcs, acc);
+        finishTile<float, TOut>(wg, ti, tile, pcs, acc);
+        return;
+    }
 
     uint a_rows[WARP_FRAGS_M];
     [unroll] for (uint mi = 0; mi < WARP_FRAGS_M; ++mi)
