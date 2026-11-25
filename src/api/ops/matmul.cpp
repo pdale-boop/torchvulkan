@@ -205,9 +205,11 @@ TuneDispatch matmul_simd_dispatch(
     // F.linear's B = weight.t() is K-major: the shader reads it as its N x K transpose, along K
     uint32_t bKMajor = ops.other_b.stride(1) == 1 && ops.other_b.stride(2) != 1;
     at::Tensor b_rows = bKMajor ? ops.other_b.transpose(1, 2) : ops.other_b;
-    uint32_t isBiasAligned = has_bias ? ops.bias_b.is_contiguous() : 1;
-    uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
-                         ops.self_b.is_contiguous() && b_rows.is_contiguous() && isBiasAligned;
+    // IS_ALIGNED needs unit column strides only: rows and batches keep their own strides, so F.linear's bias (one row
+    // broadcast, row stride 0) stays on the aligned path
+    auto unitColumns = [](const at::Tensor& t) { return t.size(2) == 1 || t.stride(2) == 1; };
+    uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) && unitColumns(ops.self_b) && unitColumns(b_rows) &&
+                         (!has_bias || unitColumns(ops.bias_b));
 
     // VEC_MEM: the rows that move as whole vectors (A, B's rows, the output) start on vector boundaries
     uint64_t vecBytes = uint64_t(vecSize) * c10::elementSize(result_dtype);
