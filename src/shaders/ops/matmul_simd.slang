@@ -72,15 +72,34 @@ static const int D2_STAGE_B = D2_KP * D2_ROW_B / 4;
 static groupshared uint4 d2A[2 * D2_STAGE_A];
 static groupshared uint4 d2B[2 * D2_STAGE_B];
 
-float dot2Acc(uint a, uint b, float c)
+interface IDot2
 {
-    half2 ha = bit_cast<half2>(a);
-    half2 hb = bit_cast<half2>(b);
-    return spirv_asm {
-        OpExtension "SPV_VALVE_mixed_float_dot_product";
-        OpCapability DotProductFloat16AccFloat32VALVE;
-        result:$$float = OpFDot2MixAcc32VALVE $ha $hb $c;
-    };
+    static float acc(uint a, uint b, float c);
+}
+
+struct Dot2Valve : IDot2
+{
+    static float acc(uint a, uint b, float c)
+    {
+        half2 ha = bit_cast<half2>(a);
+        half2 hb = bit_cast<half2>(b);
+        return spirv_asm {
+            OpExtension "SPV_VALVE_mixed_float_dot_product";
+            OpCapability DotProductFloat16AccFloat32VALVE;
+            result:$$float = OpFDot2MixAcc32VALVE $ha $hb $c;
+        };
+    }
+}
+
+// the same pair product in plain float math: AMD's Windows compiler turns this pattern into v_dot2c_f32_f16 itself
+struct Dot2Plain : IDot2
+{
+    static float acc(uint a, uint b, float c)
+    {
+        float2 fa = float2(bit_cast<half2>(a));
+        float2 fb = float2(bit_cast<half2>(b));
+        return fma(fa.y, fb.y, fma(fa.x, fb.x, c));
+    }
 }
 
 uint halfBits(uint64_t address, uint offset)
@@ -234,6 +253,22 @@ void matmul_dot2_main<T : ITorchVulkan>( // built for float16 only; T just match
     uint3 wg : SV_GroupID,
     uniform MatmulPushConstants<float> pcs)
 {
+    matmulDot2<Dot2Valve>(li, wg, pcs);
+}
+
+// without VK_VALVE_shader_mixed_float_dot_product: the same kernel, its pair products in plain float math
+[shader("compute")]
+[numthreads(WG_x, WG_y, 1)]
+void matmul_dot2_plain_main<T : ITorchVulkan>(
+    uint3 li : SV_GroupThreadID,
+    uint3 wg : SV_GroupID,
+    uniform MatmulPushConstants<float> pcs)
+{
+    matmulDot2<Dot2Plain>(li, wg, pcs);
+}
+
+void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
+{
     typealias Epilogue = LinearEpilogue<float, Activation<float>, AccumMatrix<half>>;
     const int TM = TILE_M / 16;
 
@@ -309,7 +344,7 @@ void matmul_dot2_main<T : ITorchVulkan>( // built for float16 only; T just match
 
             [unroll] for (int i = 0; i < TM; i++)
             {
-                [unroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = dot2Acc(a[i], b[j], acc[i][j]);
+                [unroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = D.acc(a[i], b[j], acc[i][j]);
             }
         }
 

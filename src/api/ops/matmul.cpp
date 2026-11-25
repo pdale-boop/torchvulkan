@@ -185,14 +185,21 @@ bool matmul_simd_fits(DeviceContext* device, c10::ScalarType compute_type, uint3
     return !device->support_subgroup_control || MATMUL_WG * MATMUL_WG <= subgroup * device->max_workgroup_subgroups;
 }
 
-// float16 matmuls run on packed dot products where the driver exposes them; TORCHVULKAN_DOT2=0 turns that off
-bool use_matmul_dot2(DeviceContext* device, c10::ScalarType dtype)
+enum class Dot2Kind { None, Valve, Plain };
+
+// float16 matmuls run on packed dot products: through VK_VALVE_shader_mixed_float_dot_product where the driver exposes
+// it, else on AMD in plain float math, which AMD's compiler turns into the same instruction.
+// TORCHVULKAN_DOT2=0 turns both off, =plain forces the plain kernel on any device.
+Dot2Kind matmul_dot2_kind(DeviceContext* device, c10::ScalarType dtype)
 {
-    static const bool disabled = [] {
-        const char* env = std::getenv("TORCHVULKAN_DOT2");
-        return env != nullptr && std::string(env) == "0";
+    static const std::string env = [] {
+        const char* e = std::getenv("TORCHVULKAN_DOT2");
+        return std::string(e ? e : "");
     }();
-    return dtype == at::kHalf && device->support_dot2_f16_f32 && !disabled;
+    if (dtype != at::kHalf || !device->support_float16 || env == "0") return Dot2Kind::None;
+    if (env == "plain") return Dot2Kind::Plain;
+    if (device->support_dot2_f16_f32) return Dot2Kind::Valve;
+    return device->properties.vendorID == 0x1002 ? Dot2Kind::Plain : Dot2Kind::None;
 }
 
 // the cooperative-matrix tuner times this too: emulated cooperative matrices can lose to it by far
@@ -228,7 +235,8 @@ TuneDispatch matmul_simd_dispatch(
 
     TuneDispatch d;
     d.subgroupSize = subgroup;
-    if (use_matmul_dot2(get_device_context(out), result_dtype))
+    Dot2Kind dot2 = matmul_dot2_kind(get_device_context(out), result_dtype);
+    if (dot2 != Dot2Kind::None)
     {
         // matmul_dot2_main loads 8 halves along K at a time (16 bytes), and an N-major B 4 halves along N (8 bytes),
         // where every row start is aligned for it; otherwise it loads element by element
@@ -238,7 +246,7 @@ TuneDispatch matmul_simd_dispatch(
         bool vec_a = strides_a[2] == 1 && strides_a[1] % 8 == 0 && strides_a[0] % 8 == 0 && address_a % 16 == 0;
         bool vec_b = b_kmajor ? strides_b[2] % 8 == 0 && strides_b[0] % 8 == 0 && address_b % 16 == 0
                               : strides_b[2] == 1 && strides_b[1] % 4 == 0 && strides_b[0] % 4 == 0 && address_b % 8 == 0;
-        d.key = ShaderKey{torchvulkan::Kernel::MATMUL_DOT2, result_dtype};
+        d.key = ShaderKey{dot2 == Dot2Kind::Valve ? torchvulkan::Kernel::MATMUL_DOT2 : torchvulkan::Kernel::MATMUL_DOT2_PLAIN, result_dtype};
         d.spd.push(MATMUL_DOT2_WG_X)
              .push(MATMUL_DOT2_WG_Y)
              .push(uint32_t(0)) // IS_ALIGNED: the epilogue reads the bias and writes the output through their strides
