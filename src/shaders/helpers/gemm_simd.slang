@@ -49,17 +49,22 @@ public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
         tensor[offset(batch, row, col)] = value;
     }
 
-    // only called under VEC_MEM, which promises the alignment
+    // only called under VEC_MEM, which promises the alignment. The word pointer comes straight from the address: AMD's
+    // Windows compiler crashes on, or misreads through, a T* bitcast to a wider pointer (#69, #73).
     public override vector<T, N> loadRow<let N : int>(uint batch, uint row, uint col)
     {
-        T* tensor = (T*)address;
-        return loadAligned<N * sizeof(T)>((vector<T, N>*)(tensor + offset(batch, row, col)));
+        uint64_t p = address + uint64_t(offset(batch, row, col)) * sizeof(T);
+        if (N * sizeof(T) == 16) return bit_cast<vector<T, N>>(loadAligned<16>((uint4*)p));
+        if (N * sizeof(T) == 8) return bit_cast<vector<T, N>>(loadAligned<8>((uint2*)p));
+        return bit_cast<vector<T, N>>(loadAligned<4>((uint*)p));
     }
 
     public override void storeRow<let N : int>(uint batch, uint row, uint col, vector<T, N> value)
     {
-        T* tensor = (T*)address;
-        storeAligned<N * sizeof(T)>((vector<T, N>*)(tensor + offset(batch, row, col)), value);
+        uint64_t p = address + uint64_t(offset(batch, row, col)) * sizeof(T);
+        if (N * sizeof(T) == 16) storeAligned<16>((uint4*)p, bit_cast<uint4>(value));
+        else if (N * sizeof(T) == 8) storeAligned<8>((uint2*)p, bit_cast<uint2>(value));
+        else storeAligned<4>((uint*)p, bit_cast<uint>(value));
     }
 }
 
