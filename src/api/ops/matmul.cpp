@@ -202,21 +202,24 @@ TuneDispatch matmul_simd_dispatch(
     uint32_t K = static_cast<uint32_t>(ops.self_b.size(2));
 
     uint32_t vecSize = get_dtype_vec_size(result_dtype);
+    // F.linear's B = weight.t() is K-major: the shader reads it as its N x K transpose, along K
+    uint32_t bKMajor = ops.other_b.stride(1) == 1 && ops.other_b.stride(2) != 1;
+    at::Tensor b_rows = bKMajor ? ops.other_b.transpose(1, 2) : ops.other_b;
     uint32_t isBiasAligned = has_bias ? ops.bias_b.is_contiguous() : 1;
-    // F.linear's B = weight.t(): K-major, contiguous along K
-    uint32_t bKMajor = ops.other_b.stride(1) == 1 && ops.other_b.stride(2) != 1 && ops.other_b.transpose(1, 2).is_contiguous();
     uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
-                         ops.self_b.is_contiguous() && (ops.other_b.is_contiguous() || bKMajor) && isBiasAligned;
+                         ops.self_b.is_contiguous() && b_rows.is_contiguous() && isBiasAligned;
 
-    // with isAligned, rows and batches are whole vectors, so only the starts need checking for VEC_MEM's wide accesses
+    // VEC_MEM: the rows that move as whole vectors (A, B's rows, the output) start on vector boundaries
     uint64_t vecBytes = uint64_t(vecSize) * c10::elementSize(result_dtype);
-    auto startsAligned = [&](const at::Tensor& t) { return get_batch_address(t, b0) % vecBytes == 0; };
-    uint32_t vecMem = isAligned && startsAligned(ops.self_b) && (bKMajor || startsAligned(ops.other_b)) && startsAligned(out);
+    auto vectorRows = [&](const at::Tensor& t) {
+        return t.stride(0) % vecSize == 0 && t.stride(1) % vecSize == 0 && get_batch_address(t, b0) % vecBytes == 0;
+    };
+    uint32_t vecMem = isAligned && vectorRows(ops.self_b) && vectorRows(b_rows) && vectorRows(out);
 
     uint32_t strides_a[4], strides_b[4], strides_c[4];
     uint32_t strides_bias[4] = {0, 0, 0, 0};
     strides_of(ops.self_b, strides_a);
-    strides_of(ops.other_b, strides_b);
+    strides_of(b_rows, strides_b);
     strides_of(out, strides_c);
     if (has_bias) strides_of(ops.bias_b, strides_bias);
 

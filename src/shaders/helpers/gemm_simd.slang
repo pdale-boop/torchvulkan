@@ -12,8 +12,7 @@ __exported import helpers.unary_ops;
 [[vk::constant_id(5)]] public const uint TILE_M = 128;
 // matmul only (conv_simd uses id 6): B's K dimension is the contiguous one (F.linear's w.t()), so its tile loads along K
 [[vk::constant_id(7)]] public const uint B_KMAJOR = 0;
-// matmul only, with IS_ALIGNED: A, an N-major B and the output start VEC-element aligned, so whole VEC runs of a row move
-// as one load or store (the host checks the addresses; rows and batches are VEC multiples once IS_ALIGNED holds)
+// matmul only, with IS_ALIGNED: the rows that loadRow/storeRow move start on VEC-element boundaries (host-checked)
 [[vk::constant_id(8)]] public const uint VEC_MEM = 0;
 
 public static const int TILE_N = 128;
@@ -32,8 +31,7 @@ public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
 
     uint offset(uint batch, uint row, uint col)
     {
-        // a contiguous operand has col stride 1; a K-major B (aligned too) has its own
-        uint col_offset = (IS_ALIGNED == 1 && B_KMAJOR == 0) ? col : col * strides.col;
+        uint col_offset = (IS_ALIGNED == 1) ? col : col * strides.col;
         return batch * strides.batch + row * strides.row + col_offset;
     }
 
@@ -222,17 +220,34 @@ public void matmulTile<
 
         if (B_KMAJOR == 1)
         {
-            // B[k][n] has k contiguous: lanes take consecutive k of one column, so TILE_K lanes read a column's tile slice
-            // in one run, and each value goes to its place in the [k][n] tile
-            [unroll] for (int i = 0; i < (TILE_K * TILE_N) / (WG_x * WG_y); ++i)
+            // b is B's transpose (N x K, contiguous along K): load it along K like A, then put each value at its [k][n] place
+            [unroll] for (int i = 0; i < loads_per_thread_B; ++i)
             {
-                uint e = thread_idx + i * threads;
-                uint k = e % TILE_K;
-                uint n = e / TILE_K;
-                uint global_row = k_block + k;
-                uint global_col = wg.x * TILE_N + n;
-                T value = (global_row < K && global_col < N) ? b.load(batch, global_row, global_col) : T(0);
-                smemB[k * VECTORS_PER_TILE_ROW_N + n / VEC][n % VEC] = value;
+                uint load_idx = thread_idx + (i * threads);
+                uint n = load_idx / VECTORS_PER_TILE_ROW_K;
+                uint k = (load_idx % VECTORS_PER_TILE_ROW_K) * VEC;
+
+                uint global_row = wg.x * TILE_N + n;
+                uint global_col = k_block + k;
+
+                vector<T, VEC> loaded_vec = vector<T, VEC>(T(0));
+                if (IS_ALIGNED == 1)
+                {
+                    if (global_row < N && global_col < K)
+                    {
+                        if (VEC_MEM == 1) loaded_vec = b.loadRow<VEC>(batch, global_row, global_col);
+                        else [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                    }
+                }
+                else
+                {
+                    [unroll] for (int v = 0; v < VEC; ++v)
+                    {
+                        if (global_row < N && (global_col + v) < K) loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                    }
+                }
+
+                [unroll] for (int v = 0; v < VEC; ++v) smemB[(k + v) * VECTORS_PER_TILE_ROW_N + n / VEC][n % VEC] = loaded_vec[v];
             }
         }
         else
