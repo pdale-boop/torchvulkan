@@ -30,7 +30,8 @@ public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
     uint offset(uint batch, uint row, uint col)
     {
         // a contiguous operand has col stride 1; a K-major B (aligned too) has its own
-        return batch * strides.batch + row * strides.row + col * strides.col;
+        uint col_offset = (IS_ALIGNED == 1 && B_KMAJOR == 0) ? col : col * strides.col;
+        return batch * strides.batch + row * strides.row + col_offset;
     }
 
     public T load(uint batch, uint row, uint col)
