@@ -148,7 +148,8 @@ uint4 loadKRun(uint64_t address, uint base, uint k_stride, uint k, uint K, bool 
 
 // one thread's share of the tile loads, kept in registers between the global read and the shared-memory write.
 // A (and a K-major B): item i < 2 * rows covers row i / 2, halves 8 * (i % 2) .. +8 of the tile's K, so two lanes
-// read 32 contiguous bytes. An N-major B: item i covers pair row i / 32 and columns 4 * (i % 32) .. +4.
+// read 32 contiguous bytes. An N-major B: item i covers pair row i / 32 and columns 4 * (i % 32) .. +4, kept as its two
+// K rows (xy, zw) and paired up in stash, so the compute doesn't wait for the loads.
 struct Dot2Loader
 {
     uint64_t a_address, b_address;
@@ -182,7 +183,7 @@ struct Dot2Loader
             if (active(p)) ra[p] = *((uint4*)(pa[p] + uint64_t(tile) * D2_TILE_K * 2));
             uint64_t b = pb[p] + uint64_t(tile) * b_step;
             if (B_KMAJOR == 1) rb[p] = *((uint4*)b);
-            else rb[p] = packPairs(*((uint2*)b), *((uint2*)(b + uint64_t(sb.row) * 2)));
+            else rb[p] = uint4(*((uint2*)b), *((uint2*)(b + uint64_t(sb.row) * 2)));
         }
     }
 
@@ -211,16 +212,18 @@ struct Dot2Loader
                 uint base = batch * sb.batch + n * sb.col;
                 if (vec_b)
                 {
-                    rb[p] = packPairs(load8(b_address, base + k * sb.row), load8(b_address, base + (k + 1) * sb.row));
+                    rb[p] = uint4(load8(b_address, base + k * sb.row), load8(b_address, base + (k + 1) * sb.row));
                 }
                 else
                 {
+                    rb[p] = uint4(0);
                     [unroll] for (uint v = 0; v < 4; v++)
                     {
                         bool col_in = n + v < N;
                         uint lo = (col_in && k < K) ? halfBits(b_address, base + v * sb.col + k * sb.row) : 0;
                         uint hi = (col_in && k + 1 < K) ? halfBits(b_address, base + v * sb.col + (k + 1) * sb.row) : 0;
-                        rb[p][v] = lo | (hi << 16);
+                        rb[p][v / 2] |= lo << (16 * (v % 2));
+                        rb[p][2 + v / 2] |= hi << (16 * (v % 2));
                     }
                 }
             }
@@ -242,7 +245,7 @@ struct Dot2Loader
             }
             else
             {
-                d2B[stage * D2_STAGE_B + ((item / 32) * D2_ROW_B + 4 * (item % 32)) / 4] = rb[p];
+                d2B[stage * D2_STAGE_B + ((item / 32) * D2_ROW_B + 4 * (item % 32)) / 4] = packPairs(rb[p].xy, rb[p].zw);
             }
         }
     }
