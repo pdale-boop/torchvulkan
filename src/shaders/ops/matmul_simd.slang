@@ -62,6 +62,7 @@ static const int D2_TILE_N = 128;
 static const int D2_TILE_K = 16;
 static const int D2_KP = D2_TILE_K / 2;
 static const int D2_TN = 16;
+static const int D2_TM_MAX = 8; // rows per thread at TILE_M = 128
 // pads each pair row by one uint4 so rows stay 16-byte aligned and the transposing stores spread over the banks
 static const int D2_PAD = 4;
 static const int D2_ROW_A = TILE_M + D2_PAD;
@@ -296,10 +297,12 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
     ld.ra[0] = uint4(0); ld.ra[1] = uint4(0);
     ld.rb[0] = uint4(0); ld.rb[1] = uint4(0);
 
-    float acc[TM][D2_TN];
-    [unroll] for (int i = 0; i < TM; i++)
+    // sized and looped by the largest TM, a compile-time constant: indexed under a spec-constant bound, AMD's Windows
+    // compiler kept the 8 x 16 accumulators in scratch memory and reloaded them every K tile
+    float acc[D2_TM_MAX][D2_TN];
+    [ForceUnroll] for (int i = 0; i < D2_TM_MAX; i++)
     {
-        [unroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = 0.0;
+        [ForceUnroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = 0.0;
     }
 
     uint row0 = li.y * TM;
@@ -327,24 +330,26 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
             else ld.fetch(k0 + D2_TILE_K);
         }
 
-        [unroll] for (uint kp = 0; kp < D2_KP; kp++)
+        [ForceUnroll] for (uint kp = 0; kp < D2_KP; kp++)
         {
-            uint a[TM];
-            [unroll] for (int i = 0; i < TM; i += 4)
+            uint a[D2_TM_MAX];
+            [ForceUnroll] for (int i = 0; i < D2_TM_MAX; i += 4)
             {
+                if (i >= TM) break;
                 uint4 a4 = d2A[stage * D2_STAGE_A + (kp * D2_ROW_A + row0 + i) / 4];
                 a[i] = a4.x; a[i + 1] = a4.y; a[i + 2] = a4.z; a[i + 3] = a4.w;
             }
             uint b[D2_TN];
-            [unroll] for (int j = 0; j < D2_TN; j += 4)
+            [ForceUnroll] for (int j = 0; j < D2_TN; j += 4)
             {
                 uint4 b4 = d2B[stage * D2_STAGE_B + (kp * D2_ROW_B + col0 + j) / 4];
                 b[j] = b4.x; b[j + 1] = b4.y; b[j + 2] = b4.z; b[j + 3] = b4.w;
             }
 
-            [unroll] for (int i = 0; i < TM; i++)
+            [ForceUnroll] for (int i = 0; i < D2_TM_MAX; i++)
             {
-                [unroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = D.acc(a[i], b[j], acc[i][j]);
+                if (i >= TM) break;
+                [ForceUnroll] for (int j = 0; j < D2_TN; j++) acc[i][j] = D.acc(a[i], b[j], acc[i][j]);
             }
         }
 
@@ -354,11 +359,12 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
         stage ^= 1;
     }
 
-    [unroll] for (int i = 0; i < TM; i++)
+    [ForceUnroll] for (int i = 0; i < D2_TM_MAX; i++)
     {
+        if (i >= TM) break;
         uint row = m0 + row0 + i;
         if (row >= pcs.M) continue;
-        [unroll] for (int j = 0; j < D2_TN; j++)
+        [ForceUnroll] for (int j = 0; j < D2_TN; j++)
         {
             uint col = n0 + col0 + j;
             if (col < pcs.N) out.store(batch, row, col, epilogue.apply(batch, row, col, acc[i][j]));
