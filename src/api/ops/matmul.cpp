@@ -1012,10 +1012,18 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
     materialize_cow(out);
     uint64_t m_align = std::min<uint64_t>(std::countr_zero(static_cast<uint64_t>(M)), 5);
     uint64_t n_align = std::min<uint64_t>(std::countr_zero(static_cast<uint64_t>(N)), 5);
+    // the staged path loads the float8 bytes through the int8 loaders (VEC 4 in scaled_mm_coop_main)
+    const uint32_t vecSize = get_dtype_vec_size(at::kChar);
+    auto vec_aligned = [&](const at::Tensor& t, uint32_t transposed, const uint32_t (&strides)[4]) {
+        uint32_t lead = transposed ? strides[2] : strides[1];
+        return get_tensor_address(t) % vecSize == 0 && lead % vecSize == 0;
+    };
+    uint32_t a_vec_aligned = vec_aligned(a, a_transposed, strides_a) ? 1 : 0;
+    uint32_t b_vec_aligned = vec_aligned(b, b_transposed, strides_b) ? 1 : 0;
 
-    // params: shape (index into shapes), warps_m, warps_n, frags_m, frags_n, bk, subgroup
+    // params: shape (index into shapes), warps_m, warps_n, frags_m, frags_n, bk, subgroup, shared, pad
     auto make_dispatch = [&](const TuneConfig& config) {
-        CoopTiling t{shapes[config[0]].first, config[1], config[2], config[3], config[4], config[5], config[6], 0};
+        CoopTiling t{shapes[config[0]].first, config[1], config[2], config[3], config[4], config[5], config[6], config[7]};
         uint32_t block_k = shapes[config[0]].second;
         uint32_t tile_m = coop_tile_m(t);
         uint32_t tile_n = coop_tile_n(t);
@@ -1036,15 +1044,15 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
              .push(a_transposed)
              .push(b_transposed)
              .push(coop_aligned(c, false) ? uint32_t(1) : uint32_t(0))
-             .push(uint32_t(1)) // LOADS_A (staging only)
+             .push(static_cast<uint32_t>(ceil_div(tile_m * t.bk / vecSize, threads))) // LOADS_A
              .push(static_cast<uint32_t>(M % tile_m == 0))
              .push(static_cast<uint32_t>(N % tile_n == 0))
-             .push(uint32_t(1)) // A_VEC_ALIGNED (staging only)
-             .push(uint32_t(1)) // B_VEC_ALIGNED (staging only)
+             .push(a_vec_aligned)
+             .push(b_vec_aligned)
              .push(t.block)
-             .push(uint32_t(0)) // USE_SHARED_MEMORY: fragments load straight from memory
-             .push(uint32_t(1)) // LOADS_B (staging only)
-             .push(uint32_t(0)) // PAD
+             .push(t.shared) // USE_SHARED_MEMORY: 0 loads the fragments straight from memory
+             .push(static_cast<uint32_t>(ceil_div(t.bk * tile_n / vecSize, threads))) // LOADS_B
+             .push(config[8]) // PAD
              .push(block_k);
         // ScaledMmPushConstants in ops/matmul_coop.slang
         d.pcs.push(get_tensor_address(a))
@@ -1082,17 +1090,24 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
         {"frags_n", {1, 2, 4}},
         {"bk", {32, 64, 128}},
         {"subgroup", subgroup_size_options(device)},
+        {"shared", {0, 1}},
+        {"pad", {0, 16}}, // shared-memory rows stay 16-byte aligned, as coop loads require
     };
     space.valid = [&](const TuneConfig& config) {
-        CoopTiling t{shapes[config[0]].first, config[1], config[2], config[3], config[4], config[5], config[6], 0};
+        CoopTiling t{shapes[config[0]].first, config[1], config[2], config[3], config[4], config[5], config[6], config[7]};
         uint32_t block_k = shapes[config[0]].second;
+        uint64_t pad = config[8];
+        if (!t.shared && pad != space.params[8].options.front()) return false;
         uint64_t subgroups = t.warps_m * t.warps_n;
         uint64_t tile_m = coop_tile_m(t);
         uint64_t tile_n = coop_tile_n(t);
-        // the float32 epilogue scratch in helpers/gemm_coop.slang
-        uint64_t shared_bytes = sizeof(float) * subgroups * t.block * t.block;
+        // must match Shared<int8_t> and the float32 EpilogueShared in helpers/gemm_coop.slang
+        uint64_t stage_a = a_transposed ? t.bk * (tile_m + pad) : tile_m * (t.bk + pad);
+        uint64_t stage_b = b_transposed ? tile_n * (t.bk + pad) : t.bk * (tile_n + pad);
+        uint64_t staged = t.shared ? 2 * (stage_a + stage_b) : tile_m * t.bk + t.bk * tile_n;
+        uint64_t shared_bytes = staged + sizeof(float) * subgroups * t.block * t.block;
         if (t.bk % block_k != 0 || K % t.bk != 0 || shared_bytes > limits.maxComputeSharedMemorySize) return false;
-        if ((1u << m_align) % t.block != 0 || (1u << n_align) % t.block != 0) return false;
+        if (!t.shared && ((1u << m_align) % t.block != 0 || (1u << n_align) % t.block != 0)) return false;
         if (subgroups > 8 || !fits_workgroup_size(device, coop_threads(t), t.subgroup)) return false;
         if (tile_m > std::max<uint64_t>(2 * max_m, t.block) || tile_n > std::max<uint64_t>(2 * max_n, t.block)) return false;
         if (ceil_div(max_n, tile_n) > limits.maxComputeWorkGroupCount[0] || ceil_div(max_m, tile_m) > limits.maxComputeWorkGroupCount[1]) return false;
