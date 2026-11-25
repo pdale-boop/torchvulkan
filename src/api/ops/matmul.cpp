@@ -225,14 +225,26 @@ TuneDispatch matmul_simd_dispatch(
     uint32_t K = static_cast<uint32_t>(ops.self_b.size(2));
 
     uint32_t vecSize = get_dtype_vec_size(result_dtype);
-    uint32_t isBiasAligned = has_bias ? ops.bias_b.is_contiguous() : 1;
-    uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
-                         ops.self_b.is_contiguous() && ops.other_b.is_contiguous() && isBiasAligned;
+    // F.linear's B = weight.t() is K-major: the shader reads it as its N x K transpose, along K
+    uint32_t bKMajor = ops.other_b.stride(1) == 1 && ops.other_b.stride(2) != 1;
+    at::Tensor b_rows = bKMajor ? ops.other_b.transpose(1, 2) : ops.other_b;
+    // IS_ALIGNED needs unit column strides only: rows and batches keep their own strides, so F.linear's bias (one row
+    // broadcast, row stride 0) stays on the aligned path
+    auto unitColumns = [](const at::Tensor& t) { return t.size(2) == 1 || t.stride(2) == 1; };
+    uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) && unitColumns(ops.self_b) && unitColumns(b_rows) &&
+                         (!has_bias || unitColumns(ops.bias_b));
+
+    // VEC_MEM: the rows that move as whole vectors (A, B's rows, the output) start on vector boundaries
+    uint64_t vecBytes = uint64_t(vecSize) * c10::elementSize(result_dtype);
+    auto vectorRows = [&](const at::Tensor& t) {
+        return t.stride(0) % vecSize == 0 && t.stride(1) % vecSize == 0 && get_batch_address(t, b0) % vecBytes == 0;
+    };
+    uint32_t vecMem = isAligned && vectorRows(ops.self_b) && vectorRows(b_rows) && vectorRows(out);
 
     uint32_t strides_a[4], strides_b[4], strides_c[4];
     uint32_t strides_bias[4] = {0, 0, 0, 0};
     strides_of(ops.self_b, strides_a);
-    strides_of(ops.other_b, strides_b);
+    strides_of(b_rows, strides_b);
     strides_of(out, strides_c);
     if (has_bias) strides_of(ops.bias_b, strides_bias);
 
@@ -241,14 +253,16 @@ TuneDispatch matmul_simd_dispatch(
     Dot2Kind dot2 = use_dot2 ? matmul_dot2_kind(get_device_context(out), result_dtype) : Dot2Kind::None;
     if (dot2 != Dot2Kind::None)
     {
+        // the dot2 kernel reads B in its own orientation (a K-major B along K through its original strides), not as the
+        // N x K transpose the SIMD kernel reads
+        strides_of(ops.other_b, strides_b);
         // matmul_dot2_main loads 8 halves along K at a time (16 bytes), and an N-major B 4 halves along N (8 bytes),
         // where every row start is aligned for it; otherwise it loads element by element
         uint64_t address_a = get_batch_address(ops.self_b, b0);
         uint64_t address_b = get_batch_address(ops.other_b, b0);
-        uint32_t b_kmajor = strides_b[1] == 1 && strides_b[2] != 1;
         bool vec_a = strides_a[2] == 1 && strides_a[1] % 8 == 0 && strides_a[0] % 8 == 0 && address_a % 16 == 0;
-        bool vec_b = b_kmajor ? strides_b[2] % 8 == 0 && strides_b[0] % 8 == 0 && address_b % 16 == 0
-                              : strides_b[2] == 1 && strides_b[1] % 4 == 0 && strides_b[0] % 4 == 0 && address_b % 8 == 0;
+        bool vec_b = bKMajor ? strides_b[2] % 8 == 0 && strides_b[0] % 8 == 0 && address_b % 16 == 0
+                             : strides_b[2] == 1 && strides_b[1] % 4 == 0 && strides_b[0] % 4 == 0 && address_b % 8 == 0;
         d.key = ShaderKey{dot2 == Dot2Kind::Valve ? torchvulkan::Kernel::MATMUL_DOT2 : torchvulkan::Kernel::MATMUL_DOT2_PLAIN, result_dtype};
         d.spd.push(MATMUL_DOT2_WG_X)
              .push(MATMUL_DOT2_WG_Y)
@@ -257,7 +271,7 @@ TuneDispatch matmul_simd_dispatch(
              .push(static_cast<uint32_t>(activation))
              .push(tile_m)
              .at(7)
-             .push(b_kmajor)
+             .push(bKMajor)
              .at(9)
              .push(uint32_t(vec_a && vec_b));
     }
@@ -269,7 +283,10 @@ TuneDispatch matmul_simd_dispatch(
              .push(isAligned)
              .push(has_bias)
              .push(static_cast<uint32_t>(activation))
-             .push(tile_m);
+             .push(tile_m)
+             .at(7)
+             .push(bKMajor)
+             .push(vecMem);
     }
 
     d.pcs.push(get_batch_address(ops.self_b, b0))

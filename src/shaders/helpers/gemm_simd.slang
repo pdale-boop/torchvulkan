@@ -12,6 +12,8 @@ __exported import helpers.unary_ops;
 [[vk::constant_id(5)]] public const uint TILE_M = 128;
 // matmul only (conv_simd uses id 6): B's K dimension is the contiguous one (F.linear's w.t()), so its tile loads along K
 [[vk::constant_id(7)]] public const uint B_KMAJOR = 0;
+// matmul only, with IS_ALIGNED: the rows that loadRow/storeRow move start on VEC-element boundaries (host-checked)
+[[vk::constant_id(8)]] public const uint VEC_MEM = 0;
 
 public static const int TILE_N = 128;
 public static const int TILE_K = 16;
@@ -44,6 +46,24 @@ public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
         T* tensor = (T*)address;
         tensor[offset(batch, row, col)] = value;
     }
+
+    // only called under VEC_MEM, which promises the alignment. The word pointer comes straight from the address: AMD's
+    // Windows compiler crashes on, or misreads through, a T* bitcast to a wider pointer (#69, #73).
+    public override vector<T, N> loadRow<let N : int>(uint batch, uint row, uint col)
+    {
+        uint64_t p = address + uint64_t(offset(batch, row, col)) * sizeof(T);
+        if (N * sizeof(T) == 16) return bit_cast<vector<T, N>>(loadAligned<16>((uint4*)p));
+        if (N * sizeof(T) == 8) return bit_cast<vector<T, N>>(loadAligned<8>((uint2*)p));
+        return bit_cast<vector<T, N>>(loadAligned<4>((uint*)p));
+    }
+
+    public override void storeRow<let N : int>(uint batch, uint row, uint col, vector<T, N> value)
+    {
+        uint64_t p = address + uint64_t(offset(batch, row, col)) * sizeof(T);
+        if (N * sizeof(T) == 16) storeAligned<16>((uint4*)p, bit_cast<uint4>(value));
+        else if (N * sizeof(T) == 8) storeAligned<8>((uint2*)p, bit_cast<uint2>(value));
+        else storeAligned<4>((uint*)p, bit_cast<uint>(value));
+    }
 }
 
 public struct AccumMatrix<T : ITorchVulkan> : IMatmulLoader<T.Accum>, IMatmulStore<T.Accum>
@@ -63,6 +83,21 @@ public struct AccumMatrix<T : ITorchVulkan> : IMatmulLoader<T.Accum>, IMatmulSto
     public void store(uint batch, uint row, uint col, T.Accum value)
     {
         matrix.store(batch, row, col, T.fromAccum(value));
+    }
+
+    public override vector<T.Accum, N> loadRow<let N : int>(uint batch, uint row, uint col)
+    {
+        vector<T, N> raw = matrix.loadRow<N>(batch, row, col);
+        vector<T.Accum, N> v;
+        [unroll] for (int i = 0; i < N; ++i) v[i] = raw[i].toAccum();
+        return v;
+    }
+
+    public override void storeRow<let N : int>(uint batch, uint row, uint col, vector<T.Accum, N> value)
+    {
+        vector<T, N> raw;
+        [unroll] for (int i = 0; i < N; ++i) raw[i] = T.fromAccum(value[i]);
+        matrix.storeRow<N>(batch, row, col, raw);
     }
 }
 
@@ -125,6 +160,9 @@ public void matmulTile<
     const int VECTORS_PER_TILE_ROW_N = TILE_N / VEC;
     const int VECTORS_PER_TILE_ROW_K = TILE_K / VEC;
     const int VECTORS_PER_THREAD_ROW_M = THREAD_SIZE_N / VEC;
+    // a thread's column vectors are COLUMN_THREADS vectors apart, so neighbouring lanes read neighbouring vectors of
+    // smemB (no bank conflicts) and write neighbouring vectors of the output
+    const int COLUMN_THREADS = VECTORS_PER_TILE_ROW_N / VECTORS_PER_THREAD_ROW_M;
 
     // 2D: Slang can't emit an array size that multiplies the TILE_M spec constant by VEC
     vector<T, VEC> accum[THREAD_SIZE_M][THREAD_SIZE_N / VEC];
@@ -136,7 +174,6 @@ public void matmulTile<
     uint thread_idx = li.y * WG_x + li.x;
     uint threads = WG_x * WG_y;
     uint thread_row_start = li.y * THREAD_SIZE_M;
-    uint thread_col_start = li.x * THREAD_SIZE_N;
 
     uint vectors_A = (TILE_M * TILE_K) / VEC;
     uint vectors_B = (TILE_K * TILE_N) / VEC;
@@ -160,7 +197,8 @@ public void matmulTile<
                 vector<T, VEC> loaded_vec = vector<T, VEC>(T(0));
                 if (global_row < M && global_col < K)
                 {
-                    [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = a.load(batch, global_row, global_col + v);
+                    if (VEC_MEM == 1) loaded_vec = a.loadRow<VEC>(batch, global_row, global_col);
+                    else [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = a.load(batch, global_row, global_col + v);
                 }
 
                 [unroll] for (int v = 0; v < VEC; ++v) smemA[row_A * (TILE_K + 1) + col_A + v] = loaded_vec[v];
@@ -182,38 +220,74 @@ public void matmulTile<
             }
         }
 
-        // loads a TILE_K x TILE_N block of B into shared memory
-        [unroll] for (int i = 0; i < loads_per_thread_B; ++i)
+        if (B_KMAJOR == 1)
         {
-            uint load_idx = thread_idx + (i * threads);
-            uint row_B = load_idx / VECTORS_PER_TILE_ROW_N;
-            uint col_B = (load_idx % VECTORS_PER_TILE_ROW_N) * VEC;
-
-            uint global_row = k_block + row_B;
-            uint global_col = wg.x * TILE_N + col_B;
-
-            vector<T, VEC> loaded_vec = vector<T, VEC>(T(0));
-
-            if (IS_ALIGNED == 1)
+            // b is B's transpose (N x K, contiguous along K): load it along K like A, then put each value at its [k][n] place
+            [unroll] for (int i = 0; i < loads_per_thread_B; ++i)
             {
-                if (global_row < K && global_col < N)
+                uint load_idx = thread_idx + (i * threads);
+                uint n = load_idx / VECTORS_PER_TILE_ROW_K;
+                uint k = (load_idx % VECTORS_PER_TILE_ROW_K) * VEC;
+
+                uint global_row = wg.x * TILE_N + n;
+                uint global_col = k_block + k;
+
+                vector<T, VEC> loaded_vec = vector<T, VEC>(T(0));
+                if (IS_ALIGNED == 1)
                 {
-                    [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = b.load(batch, global_row, global_col + v);
-                }
-            }
-            else
-            {
-                [unroll] for (int v = 0; v < VEC; ++v)
-                {
-                    if (global_row < K && (global_col + v) < N)
+                    if (global_row < N && global_col < K)
                     {
-                        loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                        if (VEC_MEM == 1) loaded_vec = b.loadRow<VEC>(batch, global_row, global_col);
+                        else [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = b.load(batch, global_row, global_col + v);
                     }
                 }
-            }
+                else
+                {
+                    [unroll] for (int v = 0; v < VEC; ++v)
+                    {
+                        if (global_row < N && (global_col + v) < K) loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                    }
+                }
 
-            uint vec_col = col_B / VEC;
-            smemB[row_B * VECTORS_PER_TILE_ROW_N + vec_col] = loaded_vec;
+                [unroll] for (int v = 0; v < VEC; ++v) smemB[(k + v) * VECTORS_PER_TILE_ROW_N + n / VEC][n % VEC] = loaded_vec[v];
+            }
+        }
+        else
+        {
+            // loads a TILE_K x TILE_N block of B into shared memory
+            [unroll] for (int i = 0; i < loads_per_thread_B; ++i)
+            {
+                uint load_idx = thread_idx + (i * threads);
+                uint row_B = load_idx / VECTORS_PER_TILE_ROW_N;
+                uint col_B = (load_idx % VECTORS_PER_TILE_ROW_N) * VEC;
+
+                uint global_row = k_block + row_B;
+                uint global_col = wg.x * TILE_N + col_B;
+
+                vector<T, VEC> loaded_vec = vector<T, VEC>(T(0));
+
+                if (IS_ALIGNED == 1)
+                {
+                    if (global_row < K && global_col < N)
+                    {
+                        if (VEC_MEM == 1) loaded_vec = b.loadRow<VEC>(batch, global_row, global_col);
+                        else [unroll] for (int v = 0; v < VEC; ++v) loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                    }
+                }
+                else
+                {
+                    [unroll] for (int v = 0; v < VEC; ++v)
+                    {
+                        if (global_row < K && (global_col + v) < N)
+                        {
+                            loaded_vec[v] = b.load(batch, global_row, global_col + v);
+                        }
+                    }
+                }
+
+                uint vec_col = col_B / VEC;
+                smemB[row_B * VECTORS_PER_TILE_ROW_N + vec_col] = loaded_vec;
+            }
         }
 
         GroupMemoryBarrierWithGroupSync();
@@ -225,8 +299,7 @@ public void matmulTile<
 
             [unroll] for (int j = 0; j < THREAD_SIZE_N / VEC; ++j)
             {
-                uint base_vec_col = (thread_col_start / VEC) + j;
-                b_frag[j] = smemB[k * VECTORS_PER_TILE_ROW_N + base_vec_col];
+                b_frag[j] = smemB[k * VECTORS_PER_TILE_ROW_N + li.x + j * COLUMN_THREADS];
             }
 
             [unroll] for (int i = 0; i < THREAD_SIZE_M; ++i)
@@ -244,7 +317,7 @@ public void matmulTile<
     }
 
     uint global_row_start = wg.y * TILE_M + thread_row_start;
-    uint global_col_start = wg.x * TILE_N + thread_col_start;
+    uint global_col_start = wg.x * TILE_N + li.x * VEC;
 
     // write the results back to global memory
     [unroll] for (int i = 0; i < THREAD_SIZE_M; ++i)
@@ -253,17 +326,25 @@ public void matmulTile<
 
         [unroll] for (int j_vec = 0; j_vec < VECTORS_PER_THREAD_ROW_M; ++j_vec)
         {
-            uint g_col_base = global_col_start + (j_vec * VEC);
+            uint g_col_base = global_col_start + j_vec * COLUMN_THREADS * VEC;
             vector<T, VEC> result_vec = accum[i][j_vec];
 
             if (IS_ALIGNED == 1)
             {
                 if (g_row < M && g_col_base < N)
                 {
-                    [unroll] for (int v = 0; v < VEC; ++v)
+                    if (VEC_MEM == 1)
                     {
-                        uint g_col = g_col_base + v;
-                        out.store(batch, g_row, g_col, epilogue.apply(batch, g_row, g_col, result_vec[v]));
+                        [unroll] for (int v = 0; v < VEC; ++v) result_vec[v] = epilogue.apply(batch, g_row, g_col_base + v, result_vec[v]);
+                        out.storeRow<VEC>(batch, g_row, g_col_base, result_vec);
+                    }
+                    else
+                    {
+                        [unroll] for (int v = 0; v < VEC; ++v)
+                        {
+                            uint g_col = g_col_base + v;
+                            out.store(batch, g_row, g_col, epilogue.apply(batch, g_row, g_col, result_vec[v]));
+                        }
                     }
                 }
             }
