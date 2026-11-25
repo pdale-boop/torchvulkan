@@ -84,23 +84,14 @@ uint encodeE4M3(float f)
     uint bits = asuint(f);
     uint sign = bits & 0x80000000u;
     bits ^= sign;
-    uint result;
-    if (bits >= (1087u << 20))
-    {
-        result = bits > 0x7F800000u ? 0x7fu : 0x7eu;
-    }
-    else if (bits < (121u << 23))
-    {
-        // under 2^-6: let the float add round the mantissa into place (denorm_mask = 2^14)
-        result = (asuint(asfloat(bits) + asfloat(141u << 23)) - (141u << 23)) & 0xffu;
-    }
-    else
-    {
-        uint mant_odd = (bits >> 20) & 1u;
-        bits += ((7u - 127u) << 23) + 0x7FFFFu + mant_odd;
-        result = (bits >> 20) & 0xffu;
-        if (result == 0x7fu) result = 0x7eu;
-    }
+    // all three cases computed and selected, so the 16 conversions of a thread don't become 16 branchy regions that the
+    // compiler issues the loads between
+    uint overflow = select(bits > 0x7F800000u, 0x7fu, 0x7eu);
+    // under 2^-6: let the float add round the mantissa into place (denorm_mask = 2^14)
+    uint small = (asuint(asfloat(bits) + asfloat(141u << 23)) - (141u << 23)) & 0xffu;
+    uint normal = ((bits + ((7u - 127u) << 23) + 0x7FFFFu + ((bits >> 20) & 1u)) >> 20) & 0xffu;
+    normal = select(normal == 0x7fu, 0x7eu, normal);
+    uint result = select(bits >= (1087u << 20), overflow, select(bits < (121u << 23), small, normal));
     return result | (sign >> 24);
 }
 
