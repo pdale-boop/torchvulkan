@@ -34,6 +34,20 @@ typedef struct VkPhysicalDeviceShaderBfloat16FeaturesKHR {
 } VkPhysicalDeviceShaderBfloat16FeaturesKHR;
 #endif
 
+// the same for VK_VALVE_shader_mixed_float_dot_product (1.4.3xx; the Windows CI's 1.3.296 lacks it)
+#ifndef VK_VALVE_shader_mixed_float_dot_product
+#define VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME "VK_VALVE_shader_mixed_float_dot_product"
+static constexpr VkStructureType VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE = static_cast<VkStructureType>(1000673000);
+typedef struct VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           shaderMixedFloatDotProductFloat16AccFloat32;
+    VkBool32           shaderMixedFloatDotProductFloat16AccFloat16;
+    VkBool32           shaderMixedFloatDotProductBFloat16Acc;
+    VkBool32           shaderMixedFloatDotProductFloat8AccFloat32;
+} VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE;
+#endif
+
 thread_local c10::DeviceIndex VulkanContext::currentDeviceIndex;
 
 static bool isEnvSet(const char* name)
