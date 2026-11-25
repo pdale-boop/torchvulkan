@@ -263,7 +263,9 @@ TuneDispatch matmul_simd_dispatch(
              .push(has_bias)
              .push(static_cast<uint32_t>(activation))
              .push(tile_m)
+             .at(7)
              .push(b_kmajor)
+             .at(9)
              .push(uint32_t(vec_a && vec_b));
     }
     else

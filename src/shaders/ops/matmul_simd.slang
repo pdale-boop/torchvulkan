@@ -55,8 +55,8 @@ void matmul_simd_main<T : ITorchVulkan, let VEC : int>(
 // VEC_LOADS says rows are 16-byte aligned along K (and, for an N-major B, 8-byte aligned along N), so tiles inside the
 // matrix load 8 halves at a time.
 
-[[vk::constant_id(6)]] const uint B_KMAJOR = 0;
-[[vk::constant_id(7)]] const uint VEC_LOADS = 0;
+// id 9: gemm_simd's ids run to 8 (conv_simd uses 6)
+[[vk::constant_id(9)]] const uint VEC_LOADS = 0;
 
 static const int D2_TILE_N = 128;
 static const int D2_TILE_K = 16;
