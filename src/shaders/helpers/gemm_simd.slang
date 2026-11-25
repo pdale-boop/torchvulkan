@@ -160,6 +160,9 @@ public void matmulTile<
     const int VECTORS_PER_TILE_ROW_N = TILE_N / VEC;
     const int VECTORS_PER_TILE_ROW_K = TILE_K / VEC;
     const int VECTORS_PER_THREAD_ROW_M = THREAD_SIZE_N / VEC;
+    // a thread's column vectors are COLUMN_THREADS vectors apart, so neighbouring lanes read neighbouring vectors of
+    // smemB (no bank conflicts) and write neighbouring vectors of the output
+    const int COLUMN_THREADS = VECTORS_PER_TILE_ROW_N / VECTORS_PER_THREAD_ROW_M;
 
     // 2D: Slang can't emit an array size that multiplies the TILE_M spec constant by VEC
     vector<T, VEC> accum[THREAD_SIZE_M][THREAD_SIZE_N / VEC];
@@ -171,7 +174,6 @@ public void matmulTile<
     uint thread_idx = li.y * WG_x + li.x;
     uint threads = WG_x * WG_y;
     uint thread_row_start = li.y * THREAD_SIZE_M;
-    uint thread_col_start = li.x * THREAD_SIZE_N;
 
     uint vectors_A = (TILE_M * TILE_K) / VEC;
     uint vectors_B = (TILE_K * TILE_N) / VEC;
@@ -297,8 +299,7 @@ public void matmulTile<
 
             [unroll] for (int j = 0; j < THREAD_SIZE_N / VEC; ++j)
             {
-                uint base_vec_col = (thread_col_start / VEC) + j;
-                b_frag[j] = smemB[k * VECTORS_PER_TILE_ROW_N + base_vec_col];
+                b_frag[j] = smemB[k * VECTORS_PER_TILE_ROW_N + li.x + j * COLUMN_THREADS];
             }
 
             [unroll] for (int i = 0; i < THREAD_SIZE_M; ++i)
@@ -316,7 +317,7 @@ public void matmulTile<
     }
 
     uint global_row_start = wg.y * TILE_M + thread_row_start;
-    uint global_col_start = wg.x * TILE_N + thread_col_start;
+    uint global_col_start = wg.x * TILE_N + li.x * VEC;
 
     // write the results back to global memory
     [unroll] for (int i = 0; i < THREAD_SIZE_M; ++i)
@@ -325,7 +326,7 @@ public void matmulTile<
 
         [unroll] for (int j_vec = 0; j_vec < VECTORS_PER_THREAD_ROW_M; ++j_vec)
         {
-            uint g_col_base = global_col_start + (j_vec * VEC);
+            uint g_col_base = global_col_start + j_vec * COLUMN_THREADS * VEC;
             vector<T, VEC> result_vec = accum[i][j_vec];
 
             if (IS_ALIGNED == 1)
