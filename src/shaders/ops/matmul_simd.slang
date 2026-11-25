@@ -109,14 +109,16 @@ uint halfBits(uint64_t address, uint offset)
     return uint(((uint16_t*)address)[offset]);
 }
 
-uint4 load16(uint64_t address, uint offset)
+// VEC_LOADS loads: the host checked that these are 16- and 8-byte aligned. The pointers come from the address, not a
+// half pointer (AMD's Windows compiler misreads a 16-bit pointer bitcast to a wider one).
+uint4 load16(uint64_t p)
 {
-    return *((uint4*)(address + uint64_t(offset) * 2));
+    return loadAligned<16>((uint4*)p);
 }
 
-uint2 load8(uint64_t address, uint offset)
+uint2 load8(uint64_t p)
 {
-    return *((uint2*)(address + uint64_t(offset) * 2));
+    return loadAligned<8>((uint2*)p);
 }
 
 uint4 packPairs(uint2 r0, uint2 r1)
@@ -135,7 +137,7 @@ void storePair(uint stage, bool is_a, uint kp, uint i, uint value)
 // eight halves along K from element offset base + k * k_stride, as four K pairs; zero past the matrix
 uint4 loadKRun(uint64_t address, uint base, uint k_stride, uint k, uint K, bool inside, bool vec)
 {
-    if (vec) return load16(address, base + k);
+    if (vec) return load16(address + uint64_t(base + k) * 2);
     uint4 pairs = uint4(0);
     [unroll] for (uint q = 0; q < 4; q++)
     {
@@ -180,10 +182,10 @@ struct Dot2Loader
     {
         [unroll] for (uint p = 0; p < 2; p++)
         {
-            if (active(p)) ra[p] = *((uint4*)(pa[p] + uint64_t(tile) * D2_TILE_K * 2));
+            if (active(p)) ra[p] = load16(pa[p] + uint64_t(tile) * D2_TILE_K * 2);
             uint64_t b = pb[p] + uint64_t(tile) * b_step;
-            if (B_KMAJOR == 1) rb[p] = *((uint4*)b);
-            else rb[p] = uint4(*((uint2*)b), *((uint2*)(b + uint64_t(sb.row) * 2)));
+            if (B_KMAJOR == 1) rb[p] = load16(b);
+            else rb[p] = uint4(load8(b), load8(b + uint64_t(sb.row) * 2));
         }
     }
 
@@ -212,7 +214,8 @@ struct Dot2Loader
                 uint base = batch * sb.batch + n * sb.col;
                 if (vec_b)
                 {
-                    rb[p] = uint4(load8(b_address, base + k * sb.row), load8(b_address, base + (k + 1) * sb.row));
+                    uint64_t row_k = b_address + uint64_t(base + k * sb.row) * 2;
+                    rb[p] = uint4(load8(row_k), load8(row_k + uint64_t(sb.row) * 2));
                 }
                 else
                 {
