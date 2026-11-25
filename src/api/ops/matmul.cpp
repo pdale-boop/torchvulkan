@@ -208,6 +208,11 @@ TuneDispatch matmul_simd_dispatch(
     uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
                          ops.self_b.is_contiguous() && (ops.other_b.is_contiguous() || bKMajor) && isBiasAligned;
 
+    // with isAligned, rows and batches are whole vectors, so only the starts need checking for VEC_MEM's wide accesses
+    uint64_t vecBytes = uint64_t(vecSize) * c10::elementSize(result_dtype);
+    auto startsAligned = [&](const at::Tensor& t) { return get_batch_address(t, b0) % vecBytes == 0; };
+    uint32_t vecMem = isAligned && startsAligned(ops.self_b) && (bKMajor || startsAligned(ops.other_b)) && startsAligned(out);
+
     uint32_t strides_a[4], strides_b[4], strides_c[4];
     uint32_t strides_bias[4] = {0, 0, 0, 0};
     strides_of(ops.self_b, strides_a);
@@ -225,7 +230,8 @@ TuneDispatch matmul_simd_dispatch(
          .push(static_cast<uint32_t>(activation))
          .push(tile_m)
          .at(7)
-         .push(bKMajor);
+         .push(bKMajor)
+         .push(vecMem);
 
     d.pcs.push(get_batch_address(ops.self_b, b0))
          .push(get_batch_address(ops.other_b, b0))
