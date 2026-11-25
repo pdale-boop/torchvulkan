@@ -6,7 +6,8 @@ import core.indexing;
 // which the host builds with c10's own conversions, so the result matches the CPU bit for bit. T only sets the output width.
 
 [[vk::constant_id(0)]] const uint WG_x = 256;
-// source and destination are 16-byte aligned, so whole runs of 16 codes load and store as uint4
+// source and destination are 16-byte aligned, so whole runs of 16 codes load and store as uint4 (loadAligned /
+// storeAligned say so: a plain uint4* access only promises 4 bytes)
 [[vk::constant_id(1)]] const uint IS_ALIGNED = 0;
 
 struct Float8DecodePushConstants
@@ -39,7 +40,7 @@ void float8_decode_main<T>(
 
     if (IS_ALIGNED == 1 && first + 16 <= pcs.numel)
     {
-        uint4 codes = ((uint4*)pcs.src)[first / 16];
+        uint4 codes = loadAligned<16>((uint4*)(pcs.src + first));
         if (sizeof(T) == 2)
         {
             [unroll] for (uint q = 0; q < 2; q++)
@@ -50,7 +51,7 @@ void float8_decode_main<T>(
                     uint i = q * 8 + w * 2;
                     out[w] = table_bits[codeAt(codes, i)] | (table_bits[codeAt(codes, i + 1)] << 16);
                 }
-                ((uint4*)pcs.dst)[first / 8 + q] = out;
+                storeAligned<16>((uint4*)(pcs.dst + first * 2 + q * 16), out);
             }
         }
         else
@@ -59,7 +60,7 @@ void float8_decode_main<T>(
             {
                 uint4 out;
                 [unroll] for (uint w = 0; w < 4; w++) out[w] = table_bits[codeAt(codes, q * 4 + w)];
-                ((uint4*)pcs.dst)[first / 4 + q] = out;
+                storeAligned<16>((uint4*)(pcs.dst + first * 4 + q * 16), out);
             }
         }
         return;
@@ -123,28 +124,27 @@ void float8_encode_main<T>(
     if (IS_ALIGNED == 1 && first + 16 <= pcs.numel)
     {
         uint4 codes;
-        [unroll] for (uint w = 0; w < 4; w++)
+        [unroll] for (uint q = 0; q < 4; q++)
         {
+            // codes[q] holds values 4q .. 4q + 3
             uint word = 0;
-            [unroll] for (uint b = 0; b < 4; b++)
+            if (sizeof(T) == 2)
             {
-                uint i = w * 4 + b;
-                float v;
-                if (sizeof(T) == 2)
+                uint4 in4 = loadAligned<16>((uint4*)(pcs.src + first * 2 + (q / 2) * 16));
+                [unroll] for (uint b = 0; b < 4; b++)
                 {
-                    uint4 in4 = ((uint4*)pcs.src)[first / 8 + i / 8];
-                    uint pair = in4[(i % 8) / 2];
-                    v = wideValue((i % 2) == 0 ? (pair & 0xffffu) : (pair >> 16));
+                    uint pair = in4[(q % 2) * 2 + b / 2];
+                    word |= encodeE4M3(wideValue((b % 2) == 0 ? (pair & 0xffffu) : (pair >> 16))) << (8 * b);
                 }
-                else
-                {
-                    v = asfloat(((uint4*)pcs.src)[first / 4 + i / 4][i % 4]);
-                }
-                word |= encodeE4M3(v) << (8 * b);
             }
-            codes[w] = word;
+            else
+            {
+                uint4 in4 = loadAligned<16>((uint4*)(pcs.src + first * 4 + q * 16));
+                [unroll] for (uint b = 0; b < 4; b++) word |= encodeE4M3(asfloat(in4[b])) << (8 * b);
+            }
+            codes[q] = word;
         }
-        ((uint4*)pcs.dst)[first / 16] = codes;
+        storeAligned<16>((uint4*)(pcs.dst + first), codes);
         return;
     }
 
