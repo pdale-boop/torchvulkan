@@ -187,27 +187,20 @@ bool matmul_simd_fits(DeviceContext* device, c10::ScalarType compute_type, uint3
 
 enum class Dot2Kind { None, Valve, Plain };
 
-// float16 matmuls run on packed dot products through VK_VALVE_shader_mixed_float_dot_product where the driver exposes
-// it. On AMD without it, the same kernel in plain float math (which AMD's Windows compiler turns into the same
-// instruction) is a tuning candidate beside the SIMD kernel, so devices where it is slower keep the SIMD kernel.
-// TORCHVULKAN_DOT2=0 turns both off, =plain makes the plain kernel a candidate on any device.
+// float16 matmuls can run on packed dot products: through VK_VALVE_shader_mixed_float_dot_product where the driver
+// exposes it, else on AMD in plain float math, which AMD's Windows compiler turns into the same instruction
 Dot2Kind matmul_dot2_kind(DeviceContext* device, c10::ScalarType dtype)
 {
-    static const std::string env = [] {
-        const char* e = std::getenv("TORCHVULKAN_DOT2");
-        return std::string(e ? e : "");
-    }();
-    if (dtype != at::kHalf || !device->support_float16 || env == "0") return Dot2Kind::None;
-    if (env == "plain") return Dot2Kind::Plain;
+    if (dtype != at::kHalf || !device->support_float16) return Dot2Kind::None;
     if (device->support_dot2_f16_f32) return Dot2Kind::Valve;
     return device->properties.vendorID == 0x1002 ? Dot2Kind::Plain : Dot2Kind::None;
 }
 
-// the tuners' dot2 parameter: 1 runs the plain dot2 kernel instead of the SIMD kernel
+// the tuners' dot2 parameter: 1 runs the dot2 kernel instead of the SIMD kernel, so devices where it is slower keep SIMD
 std::vector<uint32_t> matmul_dot2_options(DeviceContext* device, c10::ScalarType dtype)
 {
-    if (matmul_dot2_kind(device, dtype) == Dot2Kind::Plain) return {0, 1};
-    return {0};
+    if (matmul_dot2_kind(device, dtype) == Dot2Kind::None) return {0};
+    return {0, 1};
 }
 
 // the cooperative-matrix tuner times this too: emulated cooperative matrices can lose to it by far
@@ -220,7 +213,7 @@ TuneDispatch matmul_simd_dispatch(
     const at::Scalar& beta,
     uint32_t tile_m,
     uint32_t subgroup,
-    uint32_t dot2_plain,
+    uint32_t use_dot2,
     int64_t b0,
     int64_t batch)
 {
@@ -244,8 +237,7 @@ TuneDispatch matmul_simd_dispatch(
 
     TuneDispatch d;
     d.subgroupSize = subgroup;
-    Dot2Kind dot2 = matmul_dot2_kind(get_device_context(out), result_dtype);
-    if (dot2 == Dot2Kind::Plain && !dot2_plain) dot2 = Dot2Kind::None;
+    Dot2Kind dot2 = use_dot2 ? matmul_dot2_kind(get_device_context(out), result_dtype) : Dot2Kind::None;
     if (dot2 != Dot2Kind::None)
     {
         // matmul_dot2_main loads 8 halves along K at a time (16 bytes), and an N-major B 4 halves along N (8 bytes),
