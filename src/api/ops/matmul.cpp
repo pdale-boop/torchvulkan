@@ -1128,7 +1128,8 @@ std::optional<at::Tensor> scaled_mm_float8_coop(
     return out;
 }
 
-// torch.nn.functional.scaled_mm: only the tensorwise recipe without swizzling, as _scaled_mm
+// torch.nn.functional.scaled_mm: tensorwise and _scaled_mm's row-wise layout (scale_a [M, 1], scale_b [1, N]) without
+// swizzling run as _scaled_mm; other recipes on the CPU, as before this was registered
 at::Tensor scaled_mm_v2_vulkan(
     const at::Tensor& self,
     const at::Tensor& mat2,
@@ -1145,15 +1146,30 @@ at::Tensor scaled_mm_v2_vulkan(
 {
     std::vector<at::Tensor> scale_a(scale_a_list.begin(), scale_a_list.end());
     std::vector<at::Tensor> scale_b(scale_b_list.begin(), scale_b_list.end());
-    constexpr int64_t TENSORWISE = 0, NO_SWIZZLE = 0;
-    auto tensorwise = [](const std::vector<at::Tensor>& scales, at::IntArrayRef recipes, at::IntArrayRef swizzles) {
+    constexpr int64_t TENSORWISE = 0, ROWWISE = 1, NO_SWIZZLE = 0;
+    auto single = [](const std::vector<at::Tensor>& scales, at::IntArrayRef recipes, at::IntArrayRef swizzles, int64_t recipe) {
         bool unswizzled = true;
         for (int64_t s : swizzles) unswizzled &= s == NO_SWIZZLE;
-        return scales.size() == 1 && recipes.size() == 1 && recipes[0] == TENSORWISE && unswizzled;
+        return scales.size() == 1 && recipes.size() == 1 && recipes[0] == recipe && unswizzled;
     };
-    TORCH_CHECK(tensorwise(scale_a, recipe_a, swizzle_a) && tensorwise(scale_b, recipe_b, swizzle_b) && contraction_dim.empty(),
-        "scaled_mm on Vulkan: only tensorwise scaling without swizzle is supported");
-    return at::_scaled_mm(self, mat2, scale_a[0], scale_b[0], bias, std::nullopt, out_dtype, use_fast_accum);
+    bool tensorwise = single(scale_a, recipe_a, swizzle_a, TENSORWISE) && single(scale_b, recipe_b, swizzle_b, TENSORWISE);
+    bool rowwise = single(scale_a, recipe_a, swizzle_a, ROWWISE) && single(scale_b, recipe_b, swizzle_b, ROWWISE) &&
+        scale_a[0].dim() == 2 && scale_a[0].size(0) == self.size(0) && scale_a[0].size(1) == 1 &&
+        scale_b[0].dim() == 2 && scale_b[0].size(0) == 1 && scale_b[0].size(1) == mat2.size(1);
+    if ((tensorwise || rowwise) && contraction_dim.empty()) {
+        return at::_scaled_mm(self, mat2, scale_a[0], scale_b[0], bias, std::nullopt, out_dtype, use_fast_accum);
+    }
+
+    TORCHVULKAN_FALLBACK("scaled_mm with these scaling recipes can't run on the Vulkan device. Falling back to CPU.");
+    auto to_cpu = [](const std::vector<at::Tensor>& ts) {
+        std::vector<at::Tensor> cpu;
+        for (const at::Tensor& t : ts) cpu.push_back(t.cpu());
+        return cpu;
+    };
+    std::vector<at::Tensor> scale_a_cpu = to_cpu(scale_a), scale_b_cpu = to_cpu(scale_b);
+    std::optional<at::Tensor> bias_cpu = bias.has_value() && bias->defined() ? std::optional<at::Tensor>(bias->cpu()) : std::nullopt;
+    return at::_scaled_mm_v2(self.cpu(), mat2.cpu(), scale_a_cpu, recipe_a, swizzle_a, scale_b_cpu, recipe_b, swizzle_b,
+        bias_cpu, out_dtype, contraction_dim, use_fast_accum).to(self.device());
 }
 
 at::Tensor int_mm_vulkan(const at::Tensor& self, const at::Tensor& mat2)
