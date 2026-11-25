@@ -139,7 +139,8 @@ struct ChunkShape {
 // a chunk on an RX 6800 XT and an RTX 5070 Ti, and 2-4x slower at 32). Even chunks, so the matmuls see one shape.
 ChunkShape low_precision_chunk_shape(const Attention& a)
 {
-    const int64_t budget = (int64_t(128) << 20) / static_cast<int64_t>(c10::elementSize(a.dtype));
+    // the scores are float32
+    const int64_t budget = (int64_t(128) << 20) / static_cast<int64_t>(sizeof(float));
     // the scores of one query row in each query head of one key/value head
     const int64_t row = std::max<int64_t>(a.B * a.group * a.S, 1);
     const int64_t L = std::max<int64_t>(a.L, 1);
@@ -156,20 +157,22 @@ std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention
 {
     at::Tensor bias = expanded_bias(a);
     at::Tensor lse = at::empty({a.B, a.Hq, a.L}, a.q.options().dtype(a.accumulate));
-    // with beta 0 baddbmm ignores its input; alpha scales the float32 products before they're rounded to the dtype
-    at::Tensor unused = at::empty({1, 1, 1}, a.q.options());
+    // with beta 0 baddbmm ignores its input
+    at::Tensor unused = at::empty({1, 1, 1}, a.q.options().dtype(at::kFloat));
 
     const ChunkShape chunk = low_precision_chunk_shape(a);
     for (int64_t h0 = 0; h0 < a.Hk; h0 += chunk.heads) {
         const int64_t heads = std::min(chunk.heads, a.Hk - h0);
         const int64_t hq0 = h0 * a.group;
         const int64_t hq = heads * a.group;
-        at::Tensor k = a.k.narrow(1, h0, heads).reshape({a.B * heads, a.S, a.D}).transpose(1, 2);
+        // the scores stay float32: rounded to float16/bfloat16, a score of 30 is off by up to 0.016/0.125, which moves
+        // its probability by as much; the probabilities (0..1) are rounded for the second matmul, as flash attention does
+        at::Tensor k = a.k.narrow(1, h0, heads).reshape({a.B * heads, a.S, a.D}).transpose(1, 2).to(at::kFloat);
         at::Tensor v = a.v.narrow(1, h0, heads).reshape({a.B * heads, a.S, a.Dv});
         for (int64_t r0 = 0; r0 < a.L; r0 += chunk.rows) {
             const int64_t rows = std::min(chunk.rows, a.L - r0);
             // each key/value head's query heads one after another: [B * heads, group * rows, D]
-            at::Tensor q = a.q.narrow(1, hq0, hq).narrow(2, r0, rows).reshape({a.B * heads, a.group * rows, a.D});
+            at::Tensor q = a.q.narrow(1, hq0, hq).narrow(2, r0, rows).reshape({a.B * heads, a.group * rows, a.D}).to(at::kFloat);
             at::Tensor scores = at::baddbmm(unused, q, k, /*beta=*/0, /*alpha=*/a.scale).view({a.B, hq, rows, a.S});
             if (bias.defined()) scores = at::add(scores, bias.narrow(1, hq0, hq).narrow(2, r0, rows));
             if (a.causal) {
@@ -183,7 +186,8 @@ std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention
             // probabilities in place of the scores; a row with every key masked attends to nothing: probabilities 0, so
             // output 0, and logsumexp +inf
             torchvulkan::softmax_rows(scores, scores, /*log=*/false, l, /*masked_zero=*/true);
-            at::Tensor o = at::bmm(scores.view({a.B * heads, a.group * rows, a.S}), v).view({a.B, hq, rows, a.Dv});
+            at::Tensor p = scores.to(a.dtype).view({a.B * heads, a.group * rows, a.S});
+            at::Tensor o = at::bmm(p, v).view({a.B, hq, rows, a.Dv});
             out.narrow(1, hq0, hq).narrow(2, r0, rows).copy_(o);
             lse.narrow(1, hq0, hq).narrow(2, r0, rows).copy_(l);
         }
