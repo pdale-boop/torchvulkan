@@ -48,7 +48,8 @@ void matmul_simd_main<T : ITorchVulkan, let VEC : int>(
 // at the same accumulate precision. Only dispatched where VK_VALVE_shader_mixed_float_dot_product's
 // shaderMixedFloatDotProductFloat16AccFloat32 is enabled.
 //
-// The workgroup is 8 x 16 threads (WG_x along N, WG_y along M) and each thread computes 16 columns by TILE_M / 16 rows.
+// The workgroup is 8 x 16 threads (WG_x along N, WG_y along M) and each thread computes 16 columns by TILE_M / 16 rows;
+// its columns are 4 runs of 4, 32 apart, so the 8 threads along N read 32 consecutive words of sB (no bank conflicts).
 // Shared memory holds two stages of the tile as K pairs, pair-major: sA[kp][m] and sB[kp][n] are uints of two halves, so
 // a thread reads its rows and columns of one pair as uint4s. The next tile's global loads go to registers while this one
 // computes, then into the other stage. IS_ALIGNED is ignored (the host passes 0 so the epilogue honours every stride);
@@ -306,7 +307,7 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
     }
 
     uint row0 = li.y * TM;
-    uint col0 = li.x * D2_TN;
+    uint col0 = li.x * 4;
 
     // a workgroup whose tile lies inside the matrix loads its full K tiles without bounds checks
     bool interior = VEC_LOADS == 1 && m0 + TILE_M <= pcs.M && n0 + D2_TILE_N <= pcs.N;
@@ -342,7 +343,7 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
             uint b[D2_TN];
             [ForceUnroll] for (int j = 0; j < D2_TN; j += 4)
             {
-                uint4 b4 = d2B[stage * D2_STAGE_B + (kp * D2_ROW_B + col0 + j) / 4];
+                uint4 b4 = d2B[stage * D2_STAGE_B + (kp * D2_ROW_B + col0 + 8 * j) / 4];
                 b[j] = b4.x; b[j + 1] = b4.y; b[j + 2] = b4.z; b[j + 3] = b4.w;
             }
 
@@ -366,7 +367,7 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
         if (row >= pcs.M) continue;
         [ForceUnroll] for (int j = 0; j < D2_TN; j++)
         {
-            uint col = n0 + col0 + j;
+            uint col = n0 + col0 + 32 * (j / 4) + j % 4;
             if (col < pcs.N) out.store(batch, row, col, epilogue.apply(batch, row, col, acc[i][j]));
         }
     }
