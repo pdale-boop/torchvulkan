@@ -222,6 +222,9 @@ KERNELS = [
     Kernel('int_mm_coop', 'ops/matmul_coop.slang', [
         Entry('int_mm_coop_main', [I8], ('vec',)),
     ], coop_dims=(18, 1009, 22, 1013)),
+    Kernel('scaled_mm_coop', 'ops/matmul_coop.slang', [
+        Entry('scaled_mm_coop_main', [F16, BF16, F32]),
+    ], coop_dims=(18, 1009, 22, 1013)),
     Kernel('conv_coop', 'ops/conv_coop.slang', [
         Entry('conv_coop_main', FLOATS, ('vec',)),
     ], coop_dims=(18, 1009)),

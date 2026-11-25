@@ -52,6 +52,7 @@ struct DeviceContext {
     bool support_coopmat = false;
     std::vector<CoopMatShape> coopmat_shapes;
     bool support_bfloat16_coopmat = false;
+    bool support_float8_coopmat = false; // VK_EXT_shader_float8 cooperative matrices (torch._scaled_mm)
     bool support_subgroup_control = false;
     bool support_subgroup_extended_types = false;
     bool support_subgroup_arithmetic = false;
