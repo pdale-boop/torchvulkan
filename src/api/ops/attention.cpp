@@ -147,7 +147,6 @@ std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention
     at::Tensor bias = expanded_bias(a);
     if (bias.defined()) bias = bias.to(a.dtype);
     at::Tensor lse = at::empty({a.B, a.Hq, a.L}, a.q.options().dtype(a.accumulate));
-    const bool maskable = bias.defined() || a.causal;
 
     const int64_t step = low_precision_chunk_rows(a);
     for (int64_t r0 = 0; r0 < a.L; r0 += step) {
@@ -163,14 +162,9 @@ std::tuple<at::Tensor, at::Tensor> chunked_forward_low_precision(const Attention
         scores = scores.contiguous();
         at::Tensor p = at::empty_like(scores);
         at::Tensor l = at::empty({a.B, a.Hq, rows}, lse.options());
-        torchvulkan::softmax_rows(scores, p, /*log=*/false, l);
+        // a row with every key masked attends to nothing: probabilities 0, so output 0, and logsumexp +inf
+        torchvulkan::softmax_rows(scores, p, /*log=*/false, l, /*masked_zero=*/true);
         at::Tensor o = at::matmul(by_kv_head(p, a), a.v).reshape({a.B, a.Hq, rows, a.Dv});
-        if (maskable) {
-            // a row with every key masked attends to nothing: output 0 and logsumexp +inf, as the float32 path
-            at::Tensor empty = at::eq(l, neg_inf());
-            o = at::where(empty.unsqueeze(-1), at::scalar_tensor(0.0, o.options()), o);
-            l = at::where(empty, at::scalar_tensor(pos_inf(), l.options()), l);
-        }
         out.narrow(2, r0, rows).copy_(o);
         lse.narrow(2, r0, rows).copy_(l);
     }

@@ -12,7 +12,7 @@ bool softmax_rows_supported(const at::Tensor& input)
            input.numel() <= std::numeric_limits<int32_t>::max();
 }
 
-void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, const at::Tensor& lse)
+void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, const at::Tensor& lse, bool masked_zero)
 {
     TORCH_CHECK(input.is_contiguous() && out.is_contiguous() && softmax_rows_supported(input), "torchvulkan [ERROR]: softmax_rows needs contiguous float rows.");
     const int64_t length = input.dim() == 0 ? 1 : input.size(-1);
@@ -24,6 +24,7 @@ void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, cons
     const bool write_lse = lse.defined();
     TORCH_CHECK(!write_lse || (lse.is_contiguous() && lse.scalar_type() == at::kFloat && lse.numel() == rows),
                 "torchvulkan [ERROR]: softmax_rows' lse must be one contiguous float32 per row.");
+    TORCH_CHECK(!masked_zero || !log, "torchvulkan [ERROR]: softmax_rows' masked_zero is for probabilities.");
 
     DeviceContext* device = get_device_context(input);
     // a thread takes vec elements per step; about two steps per thread, from one subgroup (64 without subgroup
@@ -45,7 +46,8 @@ void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, cons
         .push(uint32_t(write_lse))
         .push(uint32_t(subgroup_reduce))
         .push(uint32_t(vec_aligned))
-        .push(uint32_t(cached));
+        .push(uint32_t(cached))
+        .push(uint32_t(masked_zero));
     PushConstantBuilder pcs{};
     pcs.push(get_tensor_address(input))
         .push(get_output_address(out))

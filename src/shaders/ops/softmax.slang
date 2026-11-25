@@ -24,6 +24,8 @@ import core.indexing;
 [[vk::constant_id(5)]] const uint VEC_ALIGNED = 0;
 // the row fits in MAX_STEPS steps: keep it in registers instead of reading it twice
 [[vk::constant_id(6)]] const uint CACHED = 0;
+// attention's convention: a row with every score masked (-inf) gets probabilities 0 and logsumexp +inf, not NaN
+[[vk::constant_id(7)]] const uint MASKED_ZERO = 0;
 
 struct SoftmaxPushConstants
 {
@@ -268,10 +270,12 @@ void softmax_main<T : ITorchVulkan, let V : int>(
 
     reduceRow(lane, m, s, special);
     // s >= 1 once the row has a finite value (its max adds exp(0)), so s == 0 means every value is -inf
-    bool nan_row = special != 0 || s == 0.0f;
+    // with MASKED_ZERO an all -inf row stays a number: writeStep gives each -inf element 0
+    bool nan_row = special != 0 || (s == 0.0f && MASKED_ZERO == 0);
     float log_s = log(s);
     if (WRITE_LSE == 1 && lane == 0)
-        ((float*)pcs.lse)[row] = special != 0 ? asfloat(QNAN) : s == 0.0f ? asfloat(NEG_INF) : m + log_s;
+        ((float*)pcs.lse)[row] = special != 0 ? asfloat(QNAN)
+            : s == 0.0f ? asfloat(MASKED_ZERO == 1 ? POS_INF : NEG_INF) : m + log_s;
 
     if (CACHED == 1)
     {

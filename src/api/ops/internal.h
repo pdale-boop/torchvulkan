@@ -9,9 +9,10 @@ namespace torchvulkan {
 
 // ops/softmax.cpp: softmax or log_softmax over the last dimension of contiguous float32 / float16 / bfloat16 rows, in
 // one kernel; out is the input's dtype, or float32 for half_to_float. lse, when defined, gets each row's logsumexp
-// (float32, one per row).
+// (float32, one per row). out may be input. masked_zero (probabilities only): attention's convention, -inf scores get
+// probability 0 and a row of only -inf logsumexp +inf.
 bool softmax_rows_supported(const at::Tensor& input);
-void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, const at::Tensor& lse = at::Tensor());
+void softmax_rows(const at::Tensor& input, const at::Tensor& out, bool log, const at::Tensor& lse = at::Tensor(), bool masked_zero = false);
 
 // ops/binary.cpp
 at::Tensor add_vulkan(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha);
