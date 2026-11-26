@@ -13,6 +13,10 @@ static const uint COL_THREADS = WG_x / ROW_THREADS;
 static const uint TILE_ROWS = ROW_THREADS * THREAD_ROWS;
 static const uint TILE_COLS = COL_THREADS * THREAD_COLS;
 static const uint OWNED = THREAD_ROWS * THREAD_COLS;
+// the host offers THREAD_ROWS and THREAD_COLS up to 4: arrays and loops use these constant bounds, because LLPC keeps
+// an array sized by a spec constant in scratch
+static const int THREAD_ROWS_MAX = 4;
+static const int THREAD_COLS_MAX = 4;
 
 struct Shared<T>
 {
@@ -51,8 +55,19 @@ void fusedConv<T : ITorchVulkan>(uint3 wg, uint ti, WinogradPushConstants pcs)
     uint tr = ti / COL_THREADS;
     uint tc = ti - tr * COL_THREADS;
 
-    A acc[16 * OWNED];
-    [unroll] for (uint i = 0; i < 16 * OWNED; ++i) acc[i] = A.ext_zero();
+    A acc[16][THREAD_ROWS_MAX][THREAD_COLS_MAX];
+    [ForceUnroll] for (int k = 0; k < 16; k++)
+    {
+        [ForceUnroll] for (int i = 0; i < THREAD_ROWS_MAX; ++i)
+        {
+            if (i >= THREAD_ROWS) break;
+            [ForceUnroll] for (int j = 0; j < THREAD_COLS_MAX; ++j)
+            {
+                if (j >= THREAD_COLS) break;
+                acc[k][i][j] = A.ext_zero();
+            }
+        }
+    }
 
     for (uint c0 = 0; c0 < pcs.cols; c0 += BK)
     {
@@ -62,22 +77,33 @@ void fusedConv<T : ITorchVulkan>(uint3 wg, uint ti, WinogradPushConstants pcs)
         {
             [ForceUnroll] for (int k = 0; k < 16; k++)
             {
-                A u[THREAD_ROWS];
-                [unroll] for (uint i = 0; i < THREAD_ROWS; ++i) u[i] = Shared<T>.U[(k * BK + c) * TILE_ROWS + tr + i * ROW_THREADS].toAccum();
-                [unroll] for (uint j = 0; j < THREAD_COLS; ++j)
+                A u[THREAD_ROWS_MAX];
+                [ForceUnroll] for (int i = 0; i < THREAD_ROWS_MAX; ++i)
                 {
+                    if (i >= THREAD_ROWS) break;
+                    u[i] = Shared<T>.U[(k * BK + c) * TILE_ROWS + tr + i * ROW_THREADS].toAccum();
+                }
+                [ForceUnroll] for (int j = 0; j < THREAD_COLS_MAX; ++j)
+                {
+                    if (j >= THREAD_COLS) break;
                     A v = Shared<T>.V[(k * BK + c) * TILE_COLS + tc + j * COL_THREADS].toAccum();
-                    [unroll] for (uint i = 0; i < THREAD_ROWS; ++i) acc[k * OWNED + i * THREAD_COLS + j] = acc[k * OWNED + i * THREAD_COLS + j] + u[i] * v;
+                    [ForceUnroll] for (int i = 0; i < THREAD_ROWS_MAX; ++i)
+                    {
+                        if (i >= THREAD_ROWS) break;
+                        acc[k][i][j] = acc[k][i][j] + u[i] * v;
+                    }
                 }
             }
         }
         GroupMemoryBarrierWithGroupSync();
     }
 
-    [unroll] for (uint i = 0; i < THREAD_ROWS; ++i)
+    [ForceUnroll] for (int i = 0; i < THREAD_ROWS_MAX; ++i)
     {
-        [unroll] for (uint j = 0; j < THREAD_COLS; ++j)
+        if (i >= THREAD_ROWS) break;
+        [ForceUnroll] for (int j = 0; j < THREAD_COLS_MAX; ++j)
         {
+            if (j >= THREAD_COLS) break;
             uint row = row0 + tr + i * ROW_THREADS;
             uint tile = col0 + tc + j * COL_THREADS;
             if (row < pcs.rows && tile < pcs.tiles)
@@ -87,7 +113,7 @@ void fusedConv<T : ITorchVulkan>(uint3 wg, uint ti, WinogradPushConstants pcs)
                 [ForceUnroll] for (int q = 0; q < 4; q++) y[q] = bias;
                 [ForceUnroll] for (int k = 0; k < 16; k++)
                 {
-                    A m = acc[k * OWNED + i * THREAD_COLS + j];
+                    A m = acc[k][i][j];
                     [ForceUnroll] for (int q = 0; q < 4; q++) y[q] = y[q] + A.castFromF32(outputWeight(q / 2, k / 4) * outputWeight(q % 2, k % 4)) * m;
                 }
                 storeTile<T>(tile, row, pcs.out_height, pcs.out_width, y, pcs);
