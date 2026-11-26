@@ -63,6 +63,10 @@ static VkResult loadVulkan()
         }
     }
 #endif
+#ifdef _WIN32
+    // AMD's Windows driver compiles with LLPC instead of its default compiler when AMD_ENABLE_LLPC=1 is set as it loads
+    if (isEnvSet("TORCHVULKAN_AMD_LLPC") && std::getenv("AMD_ENABLE_LLPC") == nullptr) _putenv_s("AMD_ENABLE_LLPC", "1");
+#endif
     return volkInitialize();
 }
 
