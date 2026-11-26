@@ -126,19 +126,25 @@ const TuneConfig& Autotuner::select(
     }
 
     const uint64_t hash = torchvulkan::SHADER_BINARIES[binary].hash;
+    std::optional<TuneConfig> loaded;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!loaded_) load();
         auto stored = stored_.find({hash, tuned_id});
-        if (stored != stored_.end() && in_space(space, stored->second)) return results_.emplace(key, stored->second).first->second;
+        if (stored != stored_.end() && in_space(space, stored->second)) {
+            if (!check || !check_) return results_.emplace(key, stored->second).first->second;
+            loaded = stored->second;
+        }
     }
 
-    TuneConfig best = fastest(space, build);
+    // a stored config is checked once per process too: the file may come from another build, or be edited by hand
+    TuneConfig best = loaded ? *loaded : fastest(space, build);
     if (check && check_ && !best.empty()) best = checked(space, build, check, std::move(best));
+    const bool replaces = !loaded || best.values != loaded->values;
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto [it, inserted] = results_.emplace(key, std::move(best));
-    if (inserted && !it->second.empty()) save(hash, tuned_id, it->second);
+    if (inserted && replaces && !it->second.empty()) save(hash, tuned_id, it->second);
     return it->second;
 }
 

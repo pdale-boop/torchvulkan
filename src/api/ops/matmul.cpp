@@ -170,9 +170,9 @@ uint64_t matmul_tune_key(const MatmulOperands& ops, uint32_t M, uint32_t N, uint
     return self_transposed | (other_transposed << 1) | (log2_ceil(M) << 8) | (log2_ceil(N) << 16) | (log2_ceil(K) << 24) | (log2_ceil(B) << 32);
 }
 
-// the tuner's output check: Freivalds' test of the first batch on the CPU, C x against alpha A (B x) + beta bias x for a
-// random x, on one row of every 16 (so every row tile) and the last row. A miscompiled config is off by O(1) or NaN,
-// far beyond rounding. Activations and integer outputs aren't checked
+// the tuner's output check: rows of the first batch recomputed on the CPU, one row in each 16-row block (at most 256
+// blocks, spread evenly) and the last row, every element compared. A miscompiled config is off by O(1) or NaN, far
+// beyond rounding. Activations and integer outputs aren't checked
 bool matmul_output_right(
     const MatmulOperands& ops,
     const at::Tensor& out,
@@ -185,32 +185,26 @@ bool matmul_output_right(
     const int64_t M = out.size(1), N = out.size(2);
     const at::TensorOptions cpu_long = at::TensorOptions().dtype(at::kLong);
     const int64_t blocks = (M + 15) / 16;
+    at::Tensor block_ids = at::arange(blocks, cpu_long);
+    if (blocks > 256) block_ids = at::linspace(0, blocks - 1, 256, at::TensorOptions().dtype(at::kDouble)).to(at::kLong);
     at::Tensor rows = at::cat({
-        (at::arange(0, blocks * 16, 16, cpu_long) + at::randint(16, {blocks}, cpu_long)).clamp_max(M - 1),
+        (block_ids * 16 + at::randint(16, {block_ids.numel()}, cpu_long)).clamp_max(M - 1),
         at::full({1}, M - 1, cpu_long),
     });
     at::Tensor device_rows = rows.to(out.device());
     auto host = [&](const at::Tensor& t) { return t.index_select(0, device_rows).cpu().to(at::kFloat); };
 
-    at::Tensor x = at::randn({N}, at::TensorOptions().dtype(at::kFloat));
-    at::Tensor b = ops.other_b[0].cpu().to(at::kFloat);
-    at::Tensor c = host(out[0]);
-    at::Tensor a = host(ops.self_b[0]);
-    const double alpha_ = alpha.toDouble(), beta_ = beta.toDouble();
+    at::Tensor got = host(out[0]);
+    at::Tensor want = at::matmul(host(ops.self_b[0]), ops.other_b[0].cpu().to(at::kFloat)) * alpha.toDouble();
+    if (has_bias) want = want + host(ops.bias_b[0].expand({M, N})) * beta.toDouble();
 
-    at::Tensor got = at::mv(c, x);
-    at::Tensor want = at::mv(a, at::mv(b, x)) * alpha_;
-    at::Tensor scale = at::mv(a.abs(), at::mv(b.abs(), x.abs())) * std::abs(alpha_);
-    if (has_bias) {
-        at::Tensor bias = host(ops.bias_b[0].expand({M, N}));
-        want = want + at::mv(bias, x) * beta_;
-        scale = scale + at::mv(bias.abs(), x.abs()) * std::abs(beta_);
-    }
-    const double tolerance = c10::elementSize(out.scalar_type()) <= 2 ? 2e-2 : 1e-3;
+    // relative to each element and to its row's size, so a near-zero element isn't held to its own rounding
+    const size_t bytes = c10::elementSize(out.scalar_type());
+    const double tolerance = bytes <= 2 ? 2e-2 : bytes == 4 ? 1e-3 : 1e-6;
     at::Tensor finite = at::isfinite(want);
-    bool right = at::equal(at::isfinite(got).logical_and(finite), finite) &&
-                 ((got - want).abs().le(scale * tolerance + 1e-30).logical_or(finite.logical_not())).all().item<bool>();
-    return right;
+    at::Tensor row_size = want.where(finite, at::zeros_like(want)).pow(2).mean(1, true).sqrt();
+    at::Tensor close = (got - want).abs().le((want.abs() + row_size) * tolerance);
+    return at::equal(at::isfinite(got).logical_and(finite), finite) && close.logical_or(finite.logical_not()).all().item<bool>();
 }
 
 // whether the SIMD kernel can run an M x N output with this tile and subgroup size
