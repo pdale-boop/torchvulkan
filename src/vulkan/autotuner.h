@@ -47,11 +47,14 @@ class Autotuner
 public:
     explicit Autotuner(DeviceContext* device);
 
+    // check, when given, is called after the chosen config has run once and says whether its output is right; a config
+    // that fails is left out and the search runs again, so a miscompiled config is never saved
     const TuneConfig& select(
         ShaderKey shader,
         uint64_t tuned_id,
         const TuneSpace& space,
-        const std::function<TuneDispatch(const TuneConfig&)>& build
+        const std::function<TuneDispatch(const TuneConfig&)>& build,
+        const std::function<bool()>& check = {}
     );
 
 private:
@@ -64,11 +67,18 @@ private:
 
     double budget_seconds_; // a search settles for its best so far after this long; 0 for no limit
     bool log_;
+    bool check_;            // TORCHVULKAN_TUNE_CHECK=0 turns the output checks off
     size_t threads_;        // compiling pipelines; GPU timing stays serial
 
     void load();
     void save(uint64_t hash, uint64_t tuned_id, const TuneConfig& config);
 
     TuneConfig fastest(const TuneSpace& space, const std::function<TuneDispatch(const TuneConfig&)>& build);
+    TuneConfig checked(
+        const TuneSpace& space,
+        const std::function<TuneDispatch(const TuneConfig&)>& build,
+        const std::function<bool()>& check,
+        TuneConfig best
+    );
     void compile(const std::vector<TuneConfig>& configs, const std::function<TuneDispatch(const TuneConfig&)>& build);
 };

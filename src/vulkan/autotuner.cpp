@@ -81,6 +81,7 @@ Autotuner::Autotuner(DeviceContext* device)
     : device(device),
       budget_seconds_(env_number("TORCHVULKAN_TUNE_BUDGET_S", 20.0)),
       log_(env_number("TORCHVULKAN_TUNE_LOG", 0) != 0),
+      check_(env_number("TORCHVULKAN_TUNE_CHECK", 1) != 0),
       threads_(std::clamp<unsigned>(std::thread::hardware_concurrency() / 2, 1u, 8u))
 {
 }
@@ -113,7 +114,8 @@ const TuneConfig& Autotuner::select(
     ShaderKey shader,
     uint64_t tuned_id,
     const TuneSpace& space,
-    const std::function<TuneDispatch(const TuneConfig&)>& build)
+    const std::function<TuneDispatch(const TuneConfig&)>& build,
+    const std::function<bool()>& check)
 {
     const uint32_t binary = device->shader_manager->resolveBinary(shader);
     const std::pair<uint32_t, uint64_t> key{binary, tuned_id};
@@ -132,6 +134,7 @@ const TuneConfig& Autotuner::select(
     }
 
     TuneConfig best = fastest(space, build);
+    if (check && check_ && !best.empty()) best = checked(space, build, check, std::move(best));
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto [it, inserted] = results_.emplace(key, std::move(best));
@@ -158,6 +161,39 @@ void Autotuner::load()
         for (uint32_t value; fields >> std::dec >> value;) config.values.push_back(value);
         stored_[{hash, tuned_id}] = std::move(config);
     }
+}
+
+TuneConfig Autotuner::checked(
+    const TuneSpace& space,
+    const std::function<TuneDispatch(const TuneConfig&)>& build,
+    const std::function<bool()>& check,
+    TuneConfig best)
+{
+    // a driver that miscompiles one config usually gets its neighbours right, so a few retries are enough; after that
+    // nothing is chosen and the op takes its fallback
+    constexpr int MAX_CHECKS = 3;
+    std::set<std::vector<uint32_t>> rejected;
+    TuneSpace remaining = space;
+    remaining.valid = [&](const TuneConfig& c) { return (!space.valid || space.valid(c)) && !rejected.count(c.values); };
+
+    for (int attempt = 0; attempt < MAX_CHECKS && !best.empty(); attempt++)
+    {
+        bool right = false;
+        try {
+            TuneDispatch d = build(best);
+            device->shader_manager->getTimestamp(
+                d.key, d.subgroupSize, d.spd.build(), d.pcs.build(), d.read, d.write, d.groupX, d.groupY, d.groupZ, 1
+            );
+            right = check();
+        } catch (const c10::Error&) {
+            // a config that fails to run is as wrong as one that computes garbage
+        }
+        if (right) return best;
+        TORCH_WARN("torchvulkan: tuned config ", describe(space, best), " gave wrong results on this device; leaving it out");
+        rejected.insert(best.values);
+        best = fastest(remaining, build);
+    }
+    return {};
 }
 
 void Autotuner::save(uint64_t hash, uint64_t tuned_id, const TuneConfig& config)

@@ -170,6 +170,49 @@ uint64_t matmul_tune_key(const MatmulOperands& ops, uint32_t M, uint32_t N, uint
     return self_transposed | (other_transposed << 1) | (log2_ceil(M) << 8) | (log2_ceil(N) << 16) | (log2_ceil(K) << 24) | (log2_ceil(B) << 32);
 }
 
+// the tuner's output check: Freivalds' test of the first batch on the CPU, C x against alpha A (B x) + beta bias x for a
+// random x, on one row of every 16 (so every row tile) and the last row. A miscompiled config is off by O(1) or NaN,
+// far beyond rounding. Activations and integer outputs aren't checked
+bool matmul_output_right(
+    const MatmulOperands& ops,
+    const at::Tensor& out,
+    bool has_bias,
+    MatmulActivation activation,
+    const at::Scalar& alpha,
+    const at::Scalar& beta)
+{
+    if (activation != MatmulActivation::NONE || !at::isFloatingType(out.scalar_type())) return true;
+    const int64_t M = out.size(1), N = out.size(2);
+    const at::TensorOptions cpu_long = at::TensorOptions().dtype(at::kLong);
+    const int64_t blocks = (M + 15) / 16;
+    at::Tensor rows = at::cat({
+        (at::arange(0, blocks * 16, 16, cpu_long) + at::randint(16, {blocks}, cpu_long)).clamp_max(M - 1),
+        at::full({1}, M - 1, cpu_long),
+    });
+    at::Tensor device_rows = rows.to(out.device());
+    auto host = [&](const at::Tensor& t) { return t.index_select(0, device_rows).cpu().to(at::kFloat); };
+
+    at::Tensor x = at::randn({N}, at::TensorOptions().dtype(at::kFloat));
+    at::Tensor b = ops.other_b[0].cpu().to(at::kFloat);
+    at::Tensor c = host(out[0]);
+    at::Tensor a = host(ops.self_b[0]);
+    const double alpha_ = alpha.toDouble(), beta_ = beta.toDouble();
+
+    at::Tensor got = at::mv(c, x);
+    at::Tensor want = at::mv(a, at::mv(b, x)) * alpha_;
+    at::Tensor scale = at::mv(a.abs(), at::mv(b.abs(), x.abs())) * std::abs(alpha_);
+    if (has_bias) {
+        at::Tensor bias = host(ops.bias_b[0].expand({M, N}));
+        want = want + at::mv(bias, x) * beta_;
+        scale = scale + at::mv(bias.abs(), x.abs()) * std::abs(beta_);
+    }
+    const double tolerance = c10::elementSize(out.scalar_type()) <= 2 ? 2e-2 : 1e-3;
+    at::Tensor finite = at::isfinite(want);
+    bool right = at::equal(at::isfinite(got).logical_and(finite), finite) &&
+                 ((got - want).abs().le(scale * tolerance + 1e-30).logical_or(finite.logical_not())).all().item<bool>();
+    return right;
+}
+
 // whether the SIMD kernel can run an M x N output with this tile and subgroup size
 bool matmul_simd_fits(DeviceContext* device, c10::ScalarType compute_type, uint32_t tile_m, uint32_t subgroup, uint32_t M, uint32_t N)
 {
@@ -312,7 +355,8 @@ at::Tensor dispatch_matmul_simd_shader(
         ShaderKey{torchvulkan::Kernel::MATMUL_SIMD, result_dtype},
         matmul_tune_key(ops, M, N, K, B),
         space,
-        [&](const TuneConfig& c) { return make_dispatch(c, 0, std::min(max_batch, B)); }
+        [&](const TuneConfig& c) { return make_dispatch(c, 0, std::min(max_batch, B)); },
+        [&]() { return matmul_output_right(ops, out, has_bias, activation, alpha, beta); }
     );
     if (config.empty()) {
         TORCHVULKAN_FALLBACK("no ", result_dtype, " matmul tile fits in the device's ", max_shared_memory, " bytes of shared memory. Falling back to CPU.");
@@ -540,7 +584,8 @@ at::Tensor dispatch_matmul_coop_shader(
         ShaderKey{torchvulkan::Kernel::MATMUL_COOP, promoted_type},
         matmul_tune_key(ops, M, N, K, B) | (m_align << 40) | (n_align << 43) | (uint64_t(direct_aligned) << 46),
         space,
-        [&](const TuneConfig& c) { return make_dispatch(c, 0, std::min(max_batch, B)); }
+        [&](const TuneConfig& c) { return make_dispatch(c, 0, std::min(max_batch, B)); },
+        [&]() { return matmul_output_right(ops, out, has_bias, activation, alpha, beta); }
     );
     if (config.empty()) return simd_fallback();
 
