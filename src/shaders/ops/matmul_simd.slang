@@ -335,7 +335,10 @@ void matmulDot2<D : IDot2>(uint3 li, uint3 wg, MatmulPushConstants<float> pcs)
             else ld.fetch(k0 + D2_TILE_K);
         }
 
-        [ForceUnroll] for (uint kp = 0; kp < D2_KP; kp++)
+        // a real loop, not unrolled: unrolled, LLPC (AMD_ENABLE_LLPC=1) hoisted all 8 pairs' shared-memory reads ahead
+        // of the dot products and ran out of registers (256 VGPRs, scratch, 2 TFLOPS at TILE_M = 128); AMD's default
+        // compiler unrolls it either way
+        [loop] for (uint kp = 0; kp < D2_KP; kp++)
         {
             uint a[D2_TM_MAX];
             [ForceUnroll] for (int i = 0; i < D2_TM_MAX; i += 4)
